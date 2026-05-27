@@ -10,9 +10,17 @@ STATE_DIR="/var/lib/tcptune"
 BASELINE="$STATE_DIR/baseline.conf"
 SESSION_LOG="$STATE_DIR/last-session.tsv"
 REMOTE_SESSION_LOG="$STATE_DIR/last-remote-session.tsv"
+MYSTERY_CONF="/etc/sysctl.d/99-zz-tcptune-mystery.conf"
+MYSTERY_BASELINE="$STATE_DIR/mystery-baseline.conf"
+MYSTERY_CANDIDATE="$STATE_DIR/mystery-candidate.conf"
+MYSTERY_LOG="$STATE_DIR/last-mystery-tune.log"
+XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
+XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 MIB=$((1024 * 1024))
 MIN_WINDOW=87380
 SSH_CONNECT_TIMEOUT=8
+SCRIPT_VERSION="v1.1.0"
+SCRIPT_DATE="2026-05-28"
 
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 red(){ printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -20,6 +28,51 @@ yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
 pause(){ read -rp "按回车返回菜单..." _; }
 has(){ command -v "$1" >/dev/null 2>&1; }
 clear_screen(){ has clear && clear || printf '\n'; }
+
+read_platform_info(){
+  PLATFORM_ID="unknown"
+  PLATFORM_NAME="未知系统"
+  PLATFORM_VERSION=""
+  PLATFORM_CODENAME=""
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    PLATFORM_ID="${ID:-unknown}"
+    PLATFORM_NAME="${PRETTY_NAME:-${NAME:-未知系统}}"
+    PLATFORM_VERSION="${VERSION_ID:-}"
+    PLATFORM_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+  fi
+  if [ -z "$PLATFORM_CODENAME" ] && has lsb_release; then
+    PLATFORM_CODENAME="$(lsb_release -sc 2>/dev/null)"
+  fi
+}
+
+is_supported_tuning_platform(){
+  read_platform_info
+  case "$PLATFORM_ID" in
+    debian|ubuntu|kali) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+show_platform_support(){
+  read_platform_info
+  printf '目标发行版识别: %s' "$PLATFORM_NAME"
+  [ -n "$PLATFORM_CODENAME" ] && printf ' (代号: %s)' "$PLATFORM_CODENAME"
+  printf '\n'
+  if is_supported_tuning_platform; then
+    green "TCP 调优与基础依赖: 支持（Debian、Ubuntu、Kali 范围）。"
+  else
+    yellow "TCP 调优与依赖安装: 当前发行版不在声明支持范围内，需自行验证。"
+  fi
+  if has apt-get && has dpkg && [ "$(dpkg --print-architecture 2>/dev/null)" = "amd64" ]; then
+    green "XanMod 自动安装: 可使用 XanMod 官方提供的 Debian-based 第三方内核仓库。"
+    [ "$PLATFORM_ID" = "kali" ] &&
+      yellow "Kali 提示: XanMod 不是 Kali 官方内核，安装后内核相关问题不属于 Kali 官方支持范围。"
+  else
+    yellow "XanMod 自动安装: 需要 amd64 架构以及 APT/dpkg 环境。"
+  fi
+}
 
 require_root(){
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -85,7 +138,12 @@ sysctl_value(){
 
 show_status(){
   clear_screen
-  green "当前 TCP / 队列参数"
+  green "系统与内核状态"
+  show_platform_support
+  printf '内核: %s\n' "$(uname -r 2>/dev/null || printf '不可用')"
+  printf '架构: %s\n' "$(uname -m 2>/dev/null || printf '不可用')"
+  echo
+  green "脚本涉及的 TCP / 队列参数"
   printf 'net.ipv4.tcp_available_congestion_control = %s\n' "$(sysctl_value net.ipv4.tcp_available_congestion_control)"
   printf 'net.ipv4.tcp_congestion_control = %s\n' "$(sysctl_value net.ipv4.tcp_congestion_control)"
   printf 'net.core.default_qdisc = %s\n' "$(sysctl_value net.core.default_qdisc)"
@@ -94,6 +152,30 @@ show_status(){
   printf 'net.core.wmem_max = %s\n' "$(sysctl_value net.core.wmem_max)"
   printf 'net.core.rmem_max = %s\n' "$(sysctl_value net.core.rmem_max)"
   echo
+  green "脚本配置与回滚基线"
+  if [ -f "$CONF" ]; then
+    printf '持久化调优配置: %s\n' "$CONF"
+    sed 's/^/  /' "$CONF"
+  else
+    printf '持久化调优配置: 未创建 (%s)\n' "$CONF"
+  fi
+  if [ -f "$BASELINE" ]; then
+    printf '调优前基线: %s\n' "$BASELINE"
+    sed 's/^/  /' "$BASELINE"
+  else
+    printf '调优前基线: 未保存 (%s)\n' "$BASELINE"
+  fi
+  if [ -f "$MYSTERY_CONF" ]; then
+    printf '迷之调参持久化配置: %s\n' "$MYSTERY_CONF"
+    sed 's/^/  /' "$MYSTERY_CONF"
+  else
+    printf '迷之调参持久化配置: 未创建 (%s)\n' "$MYSTERY_CONF"
+  fi
+  [ -f "$MYSTERY_BASELINE" ] && printf '迷之调参应用前基线: %s\n' "$MYSTERY_BASELINE"
+  [ -f "$MYSTERY_LOG" ] && printf '最近迷之调参记录: %s\n' "$MYSTERY_LOG"
+  [ -f "$SESSION_LOG" ] && printf '最近手工测试记录: %s\n' "$SESSION_LOG"
+  [ -f "$REMOTE_SESSION_LOG" ] && printf '最近远程测试记录: %s\n' "$REMOTE_SESSION_LOG"
+  echo
   green "当前接口 qdisc"
   if has tc; then
     tc qdisc show 2>/dev/null || yellow "无法读取 qdisc。"
@@ -101,22 +183,72 @@ show_status(){
     yellow "缺少 tc（通常由 iproute2 提供）。"
   fi
   echo
+  green "附加组件与工具状态"
+  show_xanmod_status
+  for command in sysctl awk iperf3 tc ping jq ssh sshpass speedtest librespeed-cli; do
+    if has "$command"; then
+      green "[已安装] $command"
+    else
+      yellow "[未检测到] $command"
+    fi
+  done
+  echo
   pause
+}
+
+xanmod_repository_codename(){
+  local codename
+  read_platform_info
+  if [ "$PLATFORM_ID" = "kali" ]; then
+    # XanMod lists Debian sid, but not kali-rolling; use its Debian-compatible rolling base.
+    printf 'sid'
+    return 0
+  fi
+  codename="$PLATFORM_CODENAME"
+  case "$codename" in
+    bookworm|trixie|forky|sid|noble|plucky|questing|resolute|faye|gigi|wilma|xia|zara|zena)
+      printf '%s' "$codename"
+      return 0
+      ;;
+  esac
+  red "XanMod 官方仓库未声明支持当前发行版代号：${codename:-未知}。"
+  return 1
+}
+
+repair_broken_xanmod_source(){
+  local codename
+  [ -f "$XANMOD_SOURCE_LIST" ] || return 0
+  grep -q 'deb\.xanmod\.org' "$XANMOD_SOURCE_LIST" 2>/dev/null || return 0
+  if ! grep -Eq 'deb\.xanmod\.org[[:space:]]+(releases|kali-rolling)[[:space:]]' "$XANMOD_SOURCE_LIST" 2>/dev/null; then
+    return 0
+  fi
+  if [ -f "$XANMOD_KEYRING" ] && codename="$(xanmod_repository_codename)"; then
+    printf 'deb [signed-by=%s] http://deb.xanmod.org %s main\n' "$XANMOD_KEYRING" "$codename" > "$XANMOD_SOURCE_LIST" || return 1
+    yellow "检测到旧的无效 XanMod 软件源，已修正为仓库代号：$codename。"
+  else
+    rm -f "$XANMOD_SOURCE_LIST" || return 1
+    yellow "检测到无效且无法修复的 XanMod 软件源，已移除以恢复 APT 可用性。"
+  fi
+}
+
+apt_update_ready(){
+  repair_broken_xanmod_source || return 1
+  apt-get update
 }
 
 install_base(){
   require_root || return 1
   if has apt-get; then
-    apt-get update &&
-      DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 iproute2 iputils-ping gawk jq openssh-client sshpass ca-certificates
+    apt_update_ready &&
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 iproute2 iputils-ping gawk jq openssh-client ca-certificates procps coreutils kmod grep sed
   elif has apk; then
-    apk add iperf3 iproute2 iputils gawk jq openssh-client sshpass ca-certificates
+    apk add iperf3 iproute2 iputils gawk jq openssh-client ca-certificates procps coreutils grep sed
   elif has dnf; then
-    dnf install -y iperf3 iproute iputils gawk jq openssh-clients sshpass ca-certificates
+    dnf install -y iperf3 iproute iputils gawk jq openssh-clients ca-certificates procps-ng coreutils grep sed
   elif has yum; then
-    yum install -y iperf3 iproute iputils gawk jq openssh-clients sshpass ca-certificates
+    yum install -y iperf3 iproute iputils gawk jq openssh-clients ca-certificates procps-ng coreutils grep sed
   else
-    red "暂不支持当前包管理器，请手动安装 iperf3、iproute2、ping、awk、jq、ssh；密码模式另需 sshpass。"
+    red "暂不支持当前包管理器，请手动安装 sysctl、cp、mkdir、cat、grep、sed、mktemp、iperf3、iproute2、ping、awk、jq、ssh；密码模式另需 sshpass。"
     return 1
   fi
 }
@@ -125,7 +257,7 @@ install_sshpass(){
   require_root || return 1
   green "正在安装密码认证所需组件：sshpass"
   if has apt-get; then
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass
+    apt_update_ready && DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass
   elif has apk; then
     apk add sshpass
   elif has dnf; then
@@ -140,9 +272,40 @@ install_sshpass(){
 
 check_env(){
   clear_screen
-  green "环境检查"
-  local missing=0 command
-  for command in sysctl awk iperf3 tc ping jq ssh; do
+  green "环境检查 / 安装基础依赖"
+  local missing=0 command package_manager="未识别"
+  show_platform_support
+  echo
+  green "运行环境与调优能力"
+  printf '当前用户: %s (UID=%s)\n' "$(id -un 2>/dev/null || printf '未知')" "${EUID:-$(id -u 2>/dev/null || printf '未知')}"
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    green "[可修改] 当前为 root，可执行安装和写入调优配置。"
+  else
+    yellow "[只读检查] 当前不是 root；安装、应用参数和恢复配置需要 root。"
+  fi
+  printf '当前内核: %s\n' "$(uname -r 2>/dev/null || printf '不可用')"
+  printf '当前架构: %s\n' "$(uname -m 2>/dev/null || printf '不可用')"
+  printf '当前拥塞控制: %s\n' "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  printf '当前默认 qdisc: %s\n' "$(sysctl_value net.core.default_qdisc)"
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    green "[可用] BBR 已在内核可用拥塞控制列表中。"
+  else
+    yellow "[未检测到] BBR 当前不在可用拥塞控制列表中；可检查内核或 XanMod。"
+  fi
+  has apt-get && package_manager="apt-get"
+  has apk && package_manager="apk"
+  has dnf && package_manager="dnf"
+  has yum && package_manager="yum"
+  printf '包管理器: %s\n' "$package_manager"
+  if [ -d "$STATE_DIR" ]; then
+    printf '脚本状态目录: %s\n' "$STATE_DIR"
+    [ -w "$STATE_DIR" ] && green "[可写] 状态目录可写。" || yellow "[不可写] 状态目录当前不可写，调优记录可能无法保存。"
+  else
+    printf '脚本状态目录: 尚未创建 (%s，首次保存配置时创建)\n' "$STATE_DIR"
+  fi
+  echo
+  green "必要命令"
+  for command in sysctl awk iperf3 tc ping jq ssh grep sed mktemp; do
     if has "$command"; then
       green "[已安装] $command"
     else
@@ -165,6 +328,12 @@ check_env(){
   else
     yellow "[可选缺少] librespeed-cli（LibreSpeed 公网测速使用）"
   fi
+  echo
+  green "已有配置 / 记录"
+  [ -f "$CONF" ] && printf '[已存在] 交互调优配置: %s\n' "$CONF" || printf '[未创建] 交互调优配置: %s\n' "$CONF"
+  [ -f "$BASELINE" ] && printf '[已存在] 交互调优基线: %s\n' "$BASELINE" || printf '[未创建] 交互调优基线: %s\n' "$BASELINE"
+  [ -f "$MYSTERY_CONF" ] && printf '[已存在] 迷之调参配置: %s\n' "$MYSTERY_CONF" || printf '[未创建] 迷之调参配置: %s\n' "$MYSTERY_CONF"
+  [ -f "$MYSTERY_LOG" ] && printf '[已存在] 迷之调参日志: %s\n' "$MYSTERY_LOG" || printf '[未生成] 迷之调参日志: %s\n' "$MYSTERY_LOG"
   if [ "$missing" -eq 1 ]; then
     echo
     read -rp "是否尝试安装缺失依赖？[y/N]: " yn
@@ -174,12 +343,261 @@ check_env(){
   pause
 }
 
+xanmod_installed_packages(){
+  has dpkg-query || return 1
+  dpkg-query -W -f='${db:Status-Status}\t${binary:Package}\t${Version}\n' '*xanmod*' 2>/dev/null |
+    awk -F '\t' '$1 == "installed" { printf "%s %s\n", $2, $3; found=1 } END { exit !found }'
+}
+
+xanmod_installed_package_names(){
+  has dpkg-query || return 1
+  dpkg-query -W -f='${db:Status-Status}\t${binary:Package}\n' '*xanmod*' 2>/dev/null |
+    awk -F '\t' '$1 == "installed" { print $2; found=1 } END { exit !found }'
+}
+
+xanmod_is_running(){
+  local release
+  release="$(uname -r 2>/dev/null)" || return 1
+  [[ "${release,,}" == *xanmod* ]]
+}
+
+xanmod_is_installed(){
+  xanmod_is_running || xanmod_installed_packages >/dev/null 2>&1
+}
+
+native_kernel_package_installed(){
+  has dpkg-query || return 1
+  dpkg-query -W -f='${db:Status-Status}\t${binary:Package}\n' 'linux-image-*' 2>/dev/null |
+    awk -F '\t' '$1 == "installed" && tolower($2) !~ /xanmod/ { found=1 } END { exit !found }'
+}
+
+show_xanmod_status(){
+  local release packages
+  release="$(uname -r 2>/dev/null || printf '无法读取')"
+  printf '当前运行内核: %s\n' "$release"
+  if xanmod_is_running; then
+    green "运行状态: 当前正在运行 XanMod 内核。"
+  else
+    yellow "运行状态: 当前未运行 XanMod 内核。"
+  fi
+  if packages="$(xanmod_installed_packages)"; then
+    echo "已安装 XanMod 软件包:"
+    printf '%s\n' "$packages"
+  else
+    yellow "软件包状态: 未检测到已安装的 XanMod 内核包。"
+  fi
+}
+
+offer_xanmod_reboot(){
+  local yn
+  xanmod_is_running && return 0
+  echo
+  yellow "XanMod 已安装但尚未运行：Linux 内核不能在当前会话中热切换。"
+  yellow "通常重启后引导程序会选用新安装的 XanMod 内核；自定义引导配置请自行确认默认启动项。"
+  read -rp "是否立即重启以尝试启用 XanMod？SSH 连接将断开。[y/N]: " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || { yellow "暂不重启；稍后重启后可再次进入本项核对运行状态。"; return 0; }
+  require_root || return 1
+  green "正在重启系统；重新连接后请再次查看 XanMod 运行状态。"
+  reboot || {
+    red "重启命令执行失败，请手动执行 reboot 后重新检查内核状态。"
+    return 1
+  }
+}
+
+install_xanmod_kernel(){
+  local architecture repository_codename
+  clear_screen
+  green "XanMod 内核安装 / 状态 / 启用"
+  echo
+  if xanmod_is_installed; then
+    green "已安装 XanMod 内核，无需重复安装。"
+    show_xanmod_status
+    offer_xanmod_reboot
+    pause
+    return
+  fi
+
+  show_xanmod_status
+  echo
+  require_root || { pause; return; }
+  if ! has apt-get || ! has dpkg-query || ! has dpkg; then
+    red "自动安装 XanMod 目前仅支持使用 APT/dpkg 的 Debian、Ubuntu、Kali 等 64 位 Debian 系系统。"
+    pause
+    return
+  fi
+  architecture="$(dpkg --print-architecture 2>/dev/null)"
+  if [ "$architecture" != "amd64" ]; then
+    red "XanMod 官方 APT 内核安装流程需要 amd64 架构；当前架构为 ${architecture:-未知}。"
+    pause
+    return
+  fi
+  read_platform_info
+  if [ "$PLATFORM_ID" = "kali" ]; then
+    yellow "注意：即将在 Kali 上安装 XanMod 第三方内核，它不由 Kali 官方维护。"
+    yellow "Kali rolling 将使用 XanMod 列出的 Debian sid 兼容仓库。"
+  fi
+  repository_codename="$(xanmod_repository_codename)" || { pause; return; }
+  green "正在添加 XanMod 官方软件源并安装 linux-xanmod-lts-x64v1..."
+  if ! apt_update_ready ||
+     ! DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates wget gnupg ||
+     ! install -d -m 0755 /etc/apt/keyrings ||
+     ! wget -qO /etc/apt/keyrings/xanmod-archive.key https://dl.xanmod.org/archive.key ||
+     ! gpg --batch --yes --dearmor -o "$XANMOD_KEYRING" /etc/apt/keyrings/xanmod-archive.key; then
+    rm -f /etc/apt/keyrings/xanmod-archive.key
+    red "准备 XanMod 官方软件源失败，未继续安装内核。"
+    pause
+    return
+  fi
+  rm -f /etc/apt/keyrings/xanmod-archive.key
+  printf 'deb [signed-by=%s] http://deb.xanmod.org %s main\n' "$XANMOD_KEYRING" "$repository_codename" \
+    > "$XANMOD_SOURCE_LIST" || {
+      red "写入 XanMod 软件源失败。"
+      pause
+      return
+    }
+  if apt_update_ready &&
+     DEBIAN_FRONTEND=noninteractive apt-get install -y linux-xanmod-lts-x64v1; then
+    echo
+    green "XanMod 内核安装完成。重启系统后才会切换并启用新内核。"
+    show_xanmod_status
+    offer_xanmod_reboot
+  else
+    red "XanMod 内核安装失败，请检查上方 APT 输出和系统发行版支持情况。"
+  fi
+  pause
+}
+
+remove_sshpass_component(){
+  if ! has sshpass; then
+    green "sshpass: 未检测到，无需卸载。"
+    return 0
+  fi
+  green "正在卸载附加组件 sshpass..."
+  if has apt-get && has dpkg-query &&
+     dpkg-query -W -f='${db:Status-Status}\n' sshpass 2>/dev/null | grep -qx installed; then
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y sshpass
+  elif has apk && apk info -e sshpass >/dev/null 2>&1; then
+    apk del sshpass
+  elif has dnf && has rpm && rpm -q sshpass >/dev/null 2>&1; then
+    dnf remove -y sshpass
+  elif has yum && has rpm && rpm -q sshpass >/dev/null 2>&1; then
+    yum remove -y sshpass
+  else
+    yellow "检测到 sshpass 命令，但无法确认其包管理来源，未自动移除。"
+    return 1
+  fi
+}
+
+remove_xanmod_component(){
+  local packages removed_repo=0
+  if xanmod_is_running; then
+    yellow "当前正在运行 XanMod 内核，本次不卸载正在使用的内核包。"
+    yellow "请先重启并选择发行版原生内核启动，再次执行初始化清理以卸载 XanMod。"
+    return 1
+  fi
+  if packages="$(xanmod_installed_package_names)"; then
+    if ! has apt-get; then
+      red "检测到 XanMod 软件包，但系统没有 apt-get，无法自动卸载。"
+      return 1
+    fi
+    if ! native_kernel_package_installed; then
+      yellow "未检测到已安装的非 XanMod linux-image 内核包，为避免系统失去可启动内核，本次保留 XanMod。"
+      yellow "请先安装/确认发行版原生内核后再次执行初始化清理。"
+      return 1
+    fi
+    green "正在卸载 XanMod 内核包..."
+    # Package names originate from dpkg-query; split them as APT package arguments.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y $packages; then
+      red "XanMod 内核包卸载失败，保留软件源配置供后续处理。"
+      return 1
+    fi
+  else
+    green "XanMod: 未检测到已安装内核包。"
+  fi
+  if [ -f "$XANMOD_SOURCE_LIST" ]; then
+    rm -f "$XANMOD_SOURCE_LIST"
+    removed_repo=1
+  fi
+  if [ -f "$XANMOD_KEYRING" ]; then
+    rm -f "$XANMOD_KEYRING"
+    removed_repo=1
+  fi
+  rm -f /etc/apt/keyrings/xanmod-archive.key
+  if [ "$removed_repo" -eq 1 ]; then
+    green "已移除 XanMod 软件源及签名密钥。"
+    has apt-get && apt_update_ready || true
+  fi
+}
+
+reset_to_initial_state(){
+  local yn reset_ok=1
+  clear_screen
+  green "一键卸载附加组件并恢复初始化状态"
+  echo "将执行以下操作："
+  echo "- 使用已保存的调优前基线恢复 TCP / qdisc 参数（若存在）"
+  echo "- 删除本脚本写入的交互调优 / 迷之调参持久化配置和测试记录"
+  echo "- 卸载 sshpass（不卸载 iperf3、speedtest、LibreSpeed 等基础/测速工具）"
+  echo "- 卸载未在运行中的 XanMod 内核包，并移除 XanMod 软件源"
+  echo
+  yellow "如果当前正在运行 XanMod，本次会保留其内核包，待以原生内核启动后再清理。"
+  read -rp "确认执行初始化清理？[y/N]: " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || { yellow "已取消。"; pause; return; }
+  require_root || { pause; return; }
+  echo
+
+  if [ -f "$MYSTERY_BASELINE" ]; then
+    green "正在恢复迷之调参应用前保存的网络参数基线..."
+    if sysctl -p "$MYSTERY_BASELINE"; then
+      green "运行参数已恢复为迷之调参应用前基线。"
+    else
+      red "应用迷之调参基线失败，保留配置以便重试。"
+      reset_ok=0
+    fi
+    if [ "$reset_ok" -eq 1 ] && [ -f "$BASELINE" ] && [ "$BASELINE" -ot "$MYSTERY_BASELINE" ]; then
+      green "检测到更早的交互调优基线，正在恢复其原始 TCP / qdisc 参数..."
+      if sysctl -p "$BASELINE"; then
+        green "运行参数已恢复为最初保存的交互调优基线。"
+      else
+        red "应用交互调优基线失败，保留配置以便重试。"
+        reset_ok=0
+      fi
+    fi
+  elif [ -f "$BASELINE" ]; then
+    green "正在恢复调优前保存的 TCP / qdisc 基线..."
+    if sysctl -p "$BASELINE"; then
+      green "运行参数已恢复为调优前基线。"
+    else
+      red "应用调优前基线失败，保留基线与脚本配置以便重试。"
+      reset_ok=0
+    fi
+  elif [ -f "$CONF" ] || [ -f "$MYSTERY_CONF" ]; then
+    yellow "未发现调优前基线，无法可靠还原当前运行中的 TCP 参数。"
+    yellow "将移除持久化脚本配置；下次重启后不会继续由该配置启用调优参数。"
+  else
+    green "未发现脚本持久化调优配置或回滚基线。"
+  fi
+
+  if [ "$reset_ok" -eq 1 ]; then
+    rm -f "$CONF" "$BASELINE" "$MYSTERY_CONF" "$MYSTERY_BASELINE" "$MYSTERY_CANDIDATE" "$MYSTERY_LOG" "$SESSION_LOG" "$REMOTE_SESSION_LOG"
+    green "已移除脚本调优配置、回滚基线和测试记录。"
+  fi
+  remove_sshpass_component || reset_ok=0
+  remove_xanmod_component || reset_ok=0
+  echo
+  if [ "$reset_ok" -eq 1 ]; then
+    green "初始化清理已完成。"
+  else
+    yellow "初始化清理部分完成，请根据上方提示处理保留项目。"
+  fi
+  pause
+}
+
 install_optional_speed_tool(){
   local tool="$1"
   require_root || return 1
   green "正在尝试安装可选测速组件：$tool"
   if has apt-get; then
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$tool"
+    apt_update_ready && DEBIAN_FRONTEND=noninteractive apt-get install -y "$tool"
   elif has apk; then
     apk add "$tool"
   elif has dnf; then
@@ -349,6 +767,12 @@ save_baseline_once(){
 restore_baseline(){
   clear_screen
   require_root || { pause; return; }
+  if [ -f "$MYSTERY_CONF" ]; then
+    red "当前存在迷之调参持久化配置：$MYSTERY_CONF"
+    yellow "迷之调参配置会覆盖部分基线参数，请使用“一键卸载附加组件并恢复初始化状态”完整回滚。"
+    pause
+    return
+  fi
   if [ ! -f "$BASELINE" ]; then
     red "未找到回滚基线：$BASELINE"
     pause
@@ -439,6 +863,546 @@ persist_final(){
     sysctl --system
 }
 
+mystery_read_decimal(){
+  local prompt="$1" default="$2" min="$3" max="$4" value
+  while true; do
+    read -rp "$prompt [$default]: " value
+    value="${value:-$default}"
+    if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+       awk "BEGIN{exit !($value >= $min && $value <= $max)}"; then
+      REPLY="$value"
+      return 0
+    fi
+    red "请输入 $min 到 $max 范围内的数字。"
+  done
+}
+
+mystery_check_environment(){
+  local missing=0 command yn
+  green "TCP 迷之调参环境检查"
+  for command in sysctl gawk modprobe cp mkdir cat; do
+    if has "$command"; then
+      green "[已安装] $command"
+    else
+      red "[缺少] $command"
+      missing=1
+    fi
+  done
+  if [ "$missing" -eq 1 ]; then
+    read -rp "必要依赖缺失，是否尝试安装基础依赖？[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && install_base
+    for command in sysctl gawk modprobe cp mkdir cat; do
+      has "$command" || return 1
+    done
+  fi
+  printf '当前可用拥塞控制算法: %s\n' "$(sysctl_value net.ipv4.tcp_available_congestion_control)"
+  printf '当前默认 qdisc: %s\n' "$(sysctl_value net.core.default_qdisc)"
+}
+
+mystery_choose_transport(){
+  local available choice
+  available="$(sysctl_value net.ipv4.tcp_available_congestion_control)"
+  echo
+  echo "选择拥塞控制算法（原默认值为 bbr）："
+  echo "1. bbr"
+  echo "2. cubic"
+  while true; do
+    read -rp "请选择 [1-2，默认 1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) MYSTERY_CC="bbr" ;;
+      2) MYSTERY_CC="cubic" ;;
+      *) red "请选择 1 或 2。"; continue ;;
+    esac
+    [[ " $available " == *" $MYSTERY_CC "* ]] && break
+    red "当前内核未报告 $MYSTERY_CC 可用，不能应用该配置。"
+  done
+  echo
+  echo "选择队列算法（原默认值为 cake）："
+  echo "1. cake"
+  echo "2. fq"
+  echo "3. fq_pie"
+  while true; do
+    read -rp "请选择 [1-3，默认 1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) MYSTERY_QDISC="cake"; break ;;
+      2) MYSTERY_QDISC="fq"; break ;;
+      3) MYSTERY_QDISC="fq_pie"; break ;;
+      *) red "请选择 1、2 或 3。" ;;
+    esac
+  done
+  if [ "$MYSTERY_QDISC" != "fq" ]; then
+    if has modprobe; then
+      modprobe "sch_$MYSTERY_QDISC" >/dev/null 2>&1 ||
+        yellow "无法预加载 sch_$MYSTERY_QDISC；配置应用时将由当前内核最终验证。"
+    else
+      yellow "$MYSTERY_QDISC 需要当前内核支持；未检测到 modprobe，配置应用时将最终验证。"
+    fi
+  fi
+}
+
+mystery_generate_tcp_config(){
+  local algorithm="$1" local_bw="$2" vps_bw="$3" rtt="$4" memory="$5" ramp="$6" cc="$7" qdisc="$8" aggressive="$9"
+  gawk -v local_bw="$local_bw" -v vps_bw="$vps_bw" -v rtt="$rtt" -v mem="$memory" \
+      -v ramp="$ramp" -v cc="$cc" -v qdisc="$qdisc" -v aggressive="$aggressive" -v algorithm="$algorithm" '
+    function min(a,b){ return a < b ? a : b }
+    function max(a,b){ return a > b ? a : b }
+    function clamp(x,a,b){ return min(max(x,a),b) }
+    function ceil(x){ return int(x) == x ? x : int(x) + 1 }
+    function log2(x){ return log(x)/log(2) }
+    function integer(x){ return sprintf("%.0f", int(x)) }
+    function piece(x) {
+      if (x <= 0) return 1
+      if (x <= .3) return 1 + x/.3*.5
+      if (x <= .6) return 1.5 + (x-.3)/.3
+      if (x <= 1) return 2.5 + (x-.6)/.4*1.5
+      return 4
+    }
+    function out(k,v){
+      if (v ~ /^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$/) v=integer(v)
+      printf "%s = %s\n", k, v
+    }
+    function common_policy(ipforward, redirects, neigh1, neigh2, neigh3) {
+      if (ipforward >= 0) out("net.ipv4.ip_forward",ipforward)
+      out("net.ipv4.ip_local_port_range","1024 65535")
+      out("net.ipv4.ip_no_pmtu_disc",0)
+      out("net.ipv4.route.gc_timeout",100)
+      out("net.ipv4.neigh.default.gc_stale_time",120)
+      out("net.ipv4.neigh.default.gc_thresh3",neigh3)
+      out("net.ipv4.neigh.default.gc_thresh2",neigh2)
+      out("net.ipv4.neigh.default.gc_thresh1",neigh1)
+      if (redirects) {
+        out("net.ipv4.conf.all.accept_redirects",0)
+        out("net.ipv4.conf.default.accept_redirects",0)
+        out("net.ipv4.conf.all.secure_redirects",0)
+        out("net.ipv4.conf.default.secure_redirects",0)
+        out("net.ipv4.conf.all.accept_source_route",0)
+        out("net.ipv4.conf.default.accept_source_route",0)
+        out("net.ipv4.conf.all.forwarding",0)
+        out("net.ipv4.conf.default.forwarding",0)
+      }
+      out("net.ipv4.icmp_echo_ignore_broadcasts",1)
+      out("net.ipv4.icmp_ignore_bogus_error_responses",1)
+      out("net.ipv4.conf.all.rp_filter",1)
+      out("net.ipv4.conf.default.rp_filter",1)
+      out("net.ipv4.conf.all.arp_announce",2)
+      out("net.ipv4.conf.default.arp_announce",2)
+      out("net.ipv4.conf.all.arp_ignore",1)
+      out("net.ipv4.conf.default.arp_ignore",1)
+    }
+    function system_base(swappiness, dirty, dirty_bg, minfree) {
+      out("kernel.pid_max",65535)
+      out("kernel.panic",1)
+      out("kernel.sysrq",1)
+      out("kernel.core_pattern","core_%e")
+      out("kernel.printk","3 4 1 3")
+      out("kernel.numa_balancing",0)
+      out("kernel.sched_autogroup_enabled",0)
+      out("vm.swappiness",swappiness)
+      out("vm.dirty_ratio",dirty)
+      out("vm.dirty_background_ratio",dirty_bg)
+      out("vm.panic_on_oom",1)
+      out("vm.overcommit_memory",1)
+      out("vm.min_free_kbytes",minfree)
+    }
+    function tcp_base(q, backlog, rmax, wmax, rdefault, wdefault, somax, optmem,
+                      timestamps, fin, fack, rmin, rmid, wmin, wmid, mtu, notsent,
+                      adv, moderate, metrics, synbacklog, orphans, synack, synretry) {
+      out("net.core.default_qdisc",q)
+      out("net.core.netdev_max_backlog",backlog)
+      out("net.core.rmem_max",rmax)
+      out("net.core.wmem_max",wmax)
+      out("net.core.rmem_default",rdefault)
+      out("net.core.wmem_default",wdefault)
+      out("net.core.somaxconn",somax)
+      out("net.core.optmem_max",optmem)
+      out("net.ipv4.tcp_fastopen",3)
+      out("net.ipv4.tcp_timestamps",timestamps)
+      out("net.ipv4.tcp_tw_reuse",1)
+      out("net.ipv4.tcp_fin_timeout",fin)
+      out("net.ipv4.tcp_slow_start_after_idle",0)
+      out("net.ipv4.tcp_max_tw_buckets",32768)
+      out("net.ipv4.tcp_sack",1)
+      out("net.ipv4.tcp_fack",fack)
+      out("net.ipv4.tcp_rmem",integer(rmin) " " integer(rmid) " " integer(rmax))
+      out("net.ipv4.tcp_wmem",integer(wmin) " " integer(wmid) " " integer(wmax))
+      out("net.ipv4.tcp_mtu_probing",mtu)
+      out("net.ipv4.tcp_congestion_control",cc)
+      out("net.ipv4.tcp_notsent_lowat",notsent)
+      out("net.ipv4.tcp_window_scaling",1)
+      out("net.ipv4.tcp_adv_win_scale",adv)
+      out("net.ipv4.tcp_moderate_rcvbuf",moderate)
+      out("net.ipv4.tcp_no_metrics_save",metrics)
+      out("net.ipv4.tcp_max_syn_backlog",synbacklog)
+      out("net.ipv4.tcp_max_orphans",orphans)
+      out("net.ipv4.tcp_synack_retries",synack)
+      out("net.ipv4.tcp_syn_retries",synretry)
+      out("net.ipv4.tcp_abort_on_overflow",0)
+      out("net.ipv4.tcp_stdurg",0)
+      out("net.ipv4.tcp_rfc1337",0)
+      out("net.ipv4.tcp_syncookies",1)
+    }
+    function legacy() {
+      if (rtt > 120) {
+        lf=min(4,max(1,rtt/40))
+        amp=min(4,max(1.5,2*sqrt(local_bw/vps_bw)*lf))
+        rate=int(mib*min(local_bw*amp,1.8*vps_bw)/8)
+        base=max(max(ceil(rate*rtt/1000),131072),rate*rtt/1200)
+        rmax=int(base*min(12,max(6,2*lf)))
+        wmax=int(base*min(8,max(4,1.5*lf)))
+        scale=min(4,max(2,lf))
+        somax=int(min(max(1024,ceil(rate/32768*scale)),16384))
+        backlog=int(min(max(16000,ceil(rate/8192*scale)),32000))
+        syn=int(min(max(4096,ceil(rate/4096*scale)),131072))
+        minfree=min(max(65536,rate/1024*.8),524288)
+        system_base(5,5,2,minfree)
+        tcp_base(qdisc,backlog,rmax,wmax,262144,131072,somax,min(131072,base/4),
+          1,10,1,32768,262144,16384,131072,1,min(base/4,524288),
+          min(6,ceil(1.2*lf)),0,1,syn,32768,2,2)
+        common_policy(-1,0,512,2048,4096)
+      } else {
+        amp=min(2,max(1,1.5*sqrt(local_bw/vps_bw)))
+        rate=mib*min(local_bw*amp,vps_bw)/8
+        base=max(ceil(rate*rtt/1000),24576)
+        rmax=int(3*base); wmax=int(1.5*base)
+        somax=int(min(max(256,ceil(rate/262144)),2048))
+        backlog=int(min(max(2000,ceil(rate/131072)),4000))
+        syn=int(min(max(2048,ceil(rate/65536)),16384))
+        minfree=min(max(65536,rate/1024),1048576)
+        system_base(10,10,5,minfree)
+        tcp_base(qdisc,backlog,rmax,wmax,87380,65536,somax,min(65536,base/4),
+          1,10,0,8192,87380,8192,65536,1,8192,2,1,0,syn,65536,2,3)
+        common_policy(-1,0,1024,4096,8192)
+      }
+    }
+    function arc_high(    lf,amp,rate,ratio,reduce,tp,stable,ba,qd,cs,mu,wsbase,wstol,wsmax,
+                         curve,latfac,buffac,qfac,advfac,bdp,base,cap,rcoef,wcoef,rmax,wmax,
+                         qraw,z,somax,backlog,syn,minfree,x,k,maxq) {
+      mem=max(mem,256)
+      lf=min(5,max(1,rtt/40))
+      amp=min(5,max(1.5,2*sqrt(local_bw/vps_bw)*lf))
+      rate=int(mib*min(local_bw*amp,2*vps_bw)/8)
+      ratio=local_bw/vps_bw; reduce=1
+      if (ratio>100) reduce=.06; else if (ratio>50) reduce=.12; else if (ratio>20) reduce=.2
+      else if (ratio>10) reduce=.3; else if (ratio>5) reduce=.5; else if (ratio>2) reduce=.7
+      tp=2; stable=1.5; ba=2; qd=2.5; cs=2; mu=1.5; wsbase=2; wstol=2; wsmax=8
+      if (mem<=512) { tp=1.8; stable=1.8; ba=1.5; qd=2; cs=1.5; mu=1.2; wsbase=1.5; wsmax=6 }
+      else if (mem<=2048 && mem>1024) { tp=2.2; ba=2.3; qd=3; cs=2.5; mu=1.8; wsbase=2.5; wsmax=12 }
+      else if (mem>2048) { tp=2.5; ba=2.5; qd=3.5; cs=3; mu=2; wsbase=3; wsmax=16 }
+      curve=clamp((tp/2)*log(ramp*(exp(1)-1)+1)*stable*(ba/2),.5,3)
+      latfac=clamp((log(min(1,(rtt-120)/1880)*(.5)+1)/log(1.5))*wstol*curve,1,8)
+      buffac=clamp(latfac*(10+.1*curve)*tp*ba*mu*piece(curve),1,8)
+      qfac=clamp(latfac/3*(log((rtt/1000*3)/(1-min(.9,.85*curve))*rate/131072*cs+1)/log(10000)*qd),.8,4)
+      advfac=clamp(latfac/wstol*(max(0,ceil(log2(4*ceil(rate*rtt/1000)/65535)))*wsbase)*(2*curve+1),2,wsmax)
+      bdp=ceil(rate*rtt/1000); base=max(bdp,262144)
+      if (mem<=512) base=max(max(bdp,131072),rate*rtt/1200)
+      else if (mem<=1024) base=max(max(bdp,262144),rate*rtt/1000)
+      else base=max(max(bdp,524288),rate*rtt/800)
+      cap=min(ceil(2*ramp*reduce*bdp),mem*mib*.125); if (rtt>500) cap=max(cap,ceil(.5*bdp))
+      rcoef=mem<=512?min(6,max(3,1.5*lf)):(mem<=1024?min(8,max(4,1.8*lf)):min(10,max(5,2*lf)))
+      wcoef=rcoef*buffac
+      rmax=min(int(base*rcoef),cap); wmax=min(int(base*wcoef),cap)
+      qraw=ceil(min(3*max(50,rate/131072),20000)*qfac)
+      z=mem<=512?.8:(mem<=1024?1:(mem<=2048?1.3:1.5))
+      maxq=mem<=512?8192:16384
+      somax=clamp(int(.15*qraw*z),2560,maxq)
+      backlog=clamp(int(.3*qraw*z),8192,mem<=512?16384:32768)
+      syn=clamp(int(.6*qraw*z),8192,mem<=512?32768:65536)
+      minfree=clamp(int(1024*mem*(mem<=512?.02:(mem<=1024?.025:(mem<=2048?.03:.035))))+int(.6*ceil(rate/1024)),65536,1048576)
+      system_base(5,5,2,minfree)
+      out("vm.vfs_cache_pressure",100); out("vm.dirty_expire_centisecs",3000); out("vm.dirty_writeback_centisecs",500)
+      tcp_base(qdisc,backlog,cap,cap,262144,262144,somax,int(min(262144,base/2)),
+        1,10,1,32768,262144,32768,262144,1,int(min(base/2,524288)),
+        max(2,ceil(lf*advfac)),1,1,syn,mem<=256?16384:32768,2,2)
+      out("net.ipv4.tcp_rmem","32768 262144 " integer(rmax))
+      out("net.ipv4.tcp_wmem","32768 262144 " integer(wmax))
+      common_policy(0,1,mem<=512?256:512,mem<=512?1024:2048,mem<=512?2048:4096)
+      if (aggressive == "yes") {
+        x=max(min(rate*rtt/1000*min(12,6+mem/1024),mib*mem*.15),4194304)
+        k=min(rtt/100,5); maxq=min(6*mem,24576)
+        backlog=min(maxq,6000+min(rate/1048576,15000)*k); syn=min(maxq/2,3000+min(rate/1048576,15000)*k/2)
+        out("net.core.rmem_max",2*x); out("net.core.wmem_max",x)
+        out("net.core.rmem_default",524288); out("net.core.wmem_default",524288)
+        out("net.ipv4.tcp_rmem","65536 524288 " integer(2*x)); out("net.ipv4.tcp_wmem","65536 524288 " integer(x))
+        out("net.core.netdev_max_backlog",backlog); out("net.core.somaxconn",32768)
+        out("net.ipv4.tcp_max_syn_backlog",syn); out("net.ipv4.tcp_mtu_probing",2)
+        out("net.ipv4.tcp_fack",1); out("net.ipv4.tcp_notsent_lowat",32768); out("net.core.default_qdisc","fq")
+        out("vm.min_free_kbytes",max(262144,64*mem)); out("vm.swappiness",1)
+        out("net.ipv4.tcp_mem",integer(512*mem) " " integer(768*mem) " " integer(1024*mem))
+        out("net.ipv4.tcp_keepalive_time",1200); out("net.ipv4.tcp_keepalive_intvl",60)
+        out("net.ipv4.tcp_fin_timeout",30); out("net.core.busy_read",0); out("net.core.busy_poll",0)
+        out("net.core.optmem_max",min(163840,160*mem))
+      }
+    }
+    function arc_low(    resp,jitter,burst,me,ba,qpref,conn,wsbase,wssens,wsmax,amp,rate,ratio,reduce,
+                        bdp,base,pct,floorbuf,cap,curve,latfac,buffac,qfac,advfac,rmult,wmult,
+                        rmax,wmax,qraw,z,somax,backlog,syn,minfree,x,maxq) {
+      resp=2; jitter=.3; burst=.7; me=1; ba=.8; qpref=.8; conn=1.2; wsbase=1.2; wssens=1.5; wsmax=4
+      if (mem<=256) {resp=2.5;jitter=.2;burst=.5;me=.8;ba=.6;qpref=.6;conn=1;wsbase=1;wsmax=3}
+      else if (mem<=512) {resp=2.2;jitter=.25;burst=.6;me=.9;ba=.7}
+      else if (mem>1024) {resp=1.8;jitter=.4;burst=.9;me=1.2;ba=1;qpref=1;conn=1.5;wsbase=1.4;wsmax=6}
+      amp=min(2,max(1,1.5*sqrt(local_bw/vps_bw))); rate=mib*min(local_bw*amp,vps_bw)/8
+      ratio=local_bw/vps_bw; reduce=ratio>1?max(.3,1/sqrt(min(ratio,100))):1
+      bdp=ceil(rate*rtt/1000); base=max(bdp,24576); pct=mem<=256?.10:.125; floorbuf=mem<=256?4194304:8388608
+      cap=max(min(ceil(1.5*ramp*reduce*bdp),mem*mib*pct),floorbuf)
+      curve=clamp((1/(1+exp(-4*(ramp-.3))))*(resp/2),.3,2)
+      latfac=clamp(exp(log(2)*(rtt/120-1))*curve*resp,.8,5)
+      buffac=clamp(latfac*(1+.5*curve)*me*ba*burst,.5,3)
+      qfac=clamp(log((rtt/1000*2)/(1-min(.8*curve,.95))*rate/65536*conn+1)/log(1000)*qpref*(1+jitter),.3,2)
+      advfac=clamp(latfac/wssens*(max(0,ceil(log2(2*bdp/65535)))*wsbase)*curve,1,wsmax)
+      rmult=mem<=256?2.5:(mem<=512?3:4); wmult=mem<=256?1.2:(mem<=512?1.5:2)
+      rmax=min(int(base*rmult*buffac),cap); wmax=min(int(base*wmult*buffac),cap)
+      qraw=ceil(min(2*max(100,rate/65536),10000)*qfac); z=mem<=256?.6:(mem<=512?.8:(mem<=1024?1:1.2))
+      somax=clamp(int(.2*qraw*z),256,2048); backlog=clamp(int(.4*qraw*z),2000,4000); syn=clamp(int(.8*qraw*z),2048,16384)
+      minfree=clamp(int(1024*mem*(mem<=256?.015:(mem<=512?.02:(mem<=1024?.025:.03))))+int(.5*ceil(rate/1024)),32768,1048576)
+      system_base(10,10,5,minfree)
+      out("vm.vfs_cache_pressure",100); out("vm.dirty_expire_centisecs",3000); out("vm.dirty_writeback_centisecs",500)
+      tcp_base(qdisc,backlog,cap,cap,87380,65536,somax,int(min(65536,base/4)),
+        1,10,0,8192,87380,8192,65536,1,4096,max(2,ceil(advfac)),1,0,syn,65536,2,3)
+      out("net.ipv4.tcp_rmem","8192 87380 " integer(rmax)); out("net.ipv4.tcp_wmem","8192 65536 " integer(wmax))
+      common_policy(0,1,1024,4096,8192)
+      if (aggressive == "yes") {
+        x=max(min(rate*rtt/1000*min(8,4+mem/2048),mib*mem*.12),2097152)
+        maxq=min(4*mem,16384); backlog=min(maxq,4000+min(rate/1048576,10000)); syn=min(maxq/2,2048+min(rate/1048576,10000)/2)
+        out("net.core.rmem_max",2*x); out("net.core.wmem_max",x)
+        out("net.core.rmem_default",262144); out("net.core.wmem_default",262144)
+        out("net.ipv4.tcp_rmem","32768 262144 " integer(2*x)); out("net.ipv4.tcp_wmem","32768 262144 " integer(x))
+        out("net.core.netdev_max_backlog",backlog); out("net.core.somaxconn",16384)
+        out("net.ipv4.tcp_max_syn_backlog",syn); out("net.ipv4.tcp_mtu_probing",2)
+        out("net.ipv4.tcp_timestamps",0); out("net.ipv4.tcp_fack",1); out("net.ipv4.tcp_notsent_lowat",16384)
+        out("net.core.default_qdisc","fq"); out("net.core.busy_read",50); out("net.core.busy_poll",50)
+        out("kernel.sched_min_granularity_ns",3000000); out("vm.min_free_kbytes",max(131072,32*mem)); out("vm.swappiness",1)
+        out("net.ipv4.tcp_mem",integer(384*mem) " " integer(512*mem) " " integer(768*mem))
+        out("net.ipv4.tcp_keepalive_time",600); out("net.ipv4.tcp_keepalive_intvl",30); out("net.ipv4.tcp_keepalive_probes",3)
+        out("net.ipv4.tcp_fin_timeout",15); out("net.ipv4.tcp_moderate_rcvbuf",0); out("net.core.optmem_max",min(81920,80*mem))
+      }
+    }
+    BEGIN {
+      mib=1048576
+      printf "# Managed by tcptune TCP Mystery Tuning (algorithm=%s, aggressive=%s)\n", algorithm, aggressive
+      printf "# Input: local=%s Mbps server=%s Mbps rtt=%s ms memory=%s MB curvature=%s\n", local_bw,vps_bw,rtt,mem,ramp
+      printf "# Integer-valued sysctl output is rendered as decimal integers for Linux application.\n"
+      if (algorithm == "Legacy") {
+        printf "# Legacy keeps its original inputs: memory, curvature and aggressive mode do not change its output.\n"
+        legacy()
+      } else if (rtt > 120) arc_high()
+      else arc_low()
+    }' > "$MYSTERY_CANDIDATE"
+}
+
+mystery_collapse_overrides(){
+  local collapsed="${MYSTERY_CANDIDATE}.collapsed"
+  awk '
+    /^#/ { comments[++comment_count]=$0; next }
+    /^[^[:space:]]+[[:space:]]*=/ {
+      key=$1
+      if (!(key in seen)) { order[++key_count]=key; seen[key]=1 }
+      last[key]=$0
+      next
+    }
+    { trailing[++trailing_count]=$0 }
+    END {
+      for (i=1; i<=comment_count; i++) print comments[i]
+      for (i=1; i<=key_count; i++) print last[order[i]]
+      for (i=1; i<=trailing_count; i++) print trailing[i]
+    }
+  ' "$MYSTERY_CANDIDATE" > "$collapsed" && mv "$collapsed" "$MYSTERY_CANDIDATE"
+}
+
+mystery_filter_supported_candidate(){
+  local line key filtered="${MYSTERY_CANDIDATE}.supported"
+  : > "$filtered" || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      ""|\#*) printf '%s\n' "$line" >> "$filtered"; continue ;;
+    esac
+    key="${line%%[[:space:]]*}"
+    if sysctl -n "$key" >/dev/null 2>&1; then
+      printf '%s\n' "$line" >> "$filtered"
+    else
+      yellow "当前内核不存在参数 $key，已从迷之调参配置中跳过。"
+    fi
+  done < "$MYSTERY_CANDIDATE"
+  mv "$filtered" "$MYSTERY_CANDIDATE"
+}
+
+mystery_save_baseline_once(){
+  local key value
+  require_root || return 1
+  mkdir -p "$STATE_DIR" || return 1
+  [ -f "$MYSTERY_BASELINE" ] && { yellow "已存在迷之调参回滚基线：$MYSTERY_BASELINE（不会覆盖）。"; return 0; }
+  printf '# tcptune TCP Mystery Tuning baseline captured before generated configuration\n' > "$MYSTERY_BASELINE" || return 1
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    value="$(sysctl_value "$key")"
+    [ "$value" = "不可用" ] || printf '%s = %s\n' "$key" "$value" >> "$MYSTERY_BASELINE"
+  done < <(awk -F '[[:space:]]*=[[:space:]]*' '!/^#/ && NF >= 2 {print $1}' "$MYSTERY_CANDIDATE")
+}
+
+mystery_apply_candidate(){
+  cp "$MYSTERY_CANDIDATE" "$MYSTERY_CONF" || return 1
+  if sysctl -p "$MYSTERY_CONF"; then
+    green "迷之调参 TCP 配置已应用并持久化到 $MYSTERY_CONF"
+    return 0
+  fi
+  red "配置未能完整应用，正在尝试恢复迷之调参应用前基线。"
+  sysctl -p "$MYSTERY_BASELINE" >/dev/null 2>&1 || red "自动恢复失败，请手动检查 $MYSTERY_BASELINE。"
+  rm -f "$MYSTERY_CONF"
+  return 1
+}
+
+mystery_choose_algorithm(){
+  local choice
+  echo
+  echo "选择参数生成算法："
+  echo "1. Legacy（原低/高延迟公式，支持 RTT 宽松模式）"
+  echo "2. Arc（曲率自适应；按低/高延迟场景调整缓冲与队列）"
+  while true; do
+    read -rp "请选择 [1-2]: " choice
+    case "$choice" in
+      1) MYSTERY_ALGORITHM="Legacy"; return 0 ;;
+      2) MYSTERY_ALGORITHM="Arc"; return 0 ;;
+      *) red "请选择 1 或 2。" ;;
+    esac
+  done
+}
+
+mystery_log(){
+  printf '%s\n' "$*" >> "$MYSTERY_LOG"
+}
+
+view_mystery_log(){
+  clear_screen
+  green "TCP 迷之调参 - 最近一次运行日志"
+  echo
+  if [ -f "$MYSTERY_LOG" ]; then
+    printf '日志路径: %s\n\n' "$MYSTERY_LOG"
+    cat "$MYSTERY_LOG"
+  else
+    yellow "尚未生成迷之调参日志。执行一次调参预览或应用后即可在此查看。"
+    printf '预期日志路径: %s\n' "$MYSTERY_LOG"
+  fi
+  echo
+  pause
+}
+
+mystery_tune_flow(){
+  local local_bw vps_bw rtt memory ramp aggressive relaxed yn
+  clear_screen
+  green "TCP 迷之调参"
+  echo "依据原算法公式生成完整 sysctl 配置。"
+  yellow "注意：完整复现会写入 kernel、vm、ARP、路由与转发相关策略；应用前请检查预览。"
+  echo
+  mystery_choose_algorithm
+  require_root || { pause; return; }
+  mkdir -p "$STATE_DIR" || { red "无法创建状态目录。"; pause; return; }
+  {
+    printf 'TCP 迷之调参运行日志（每次运行覆盖）\n'
+    printf 'time=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf unknown)"
+    printf 'algorithm=%s\n' "$MYSTERY_ALGORITHM"
+  } > "$MYSTERY_LOG" || { red "无法写入运行日志：$MYSTERY_LOG"; pause; return; }
+  mystery_check_environment || { mystery_log "result=environment-check-failed"; red "迷之调参必要环境未满足。"; pause; return; }
+  mystery_choose_transport || { mystery_log "result=transport-selection-failed"; pause; return; }
+  mystery_read_decimal "输入本地下载带宽 Mbps" "1000" "1" "100000"; local_bw="$REPLY"
+  mystery_read_decimal "输入服务器出口带宽 Mbps" "1000" "1" "100000"; vps_bw="$REPLY"
+  mystery_read_decimal "输入本地到服务器 RTT ms" "50" "1" "2000"; rtt="$REPLY"
+  mystery_read_decimal "输入服务器可用内存 MB" "1024" "64" "32768"; memory="$REPLY"
+  mystery_read_decimal "输入曲率" "0.7" "0.1" "1"; ramp="$REPLY"
+  if [ "$MYSTERY_ALGORITHM" = "Arc" ]; then
+    read -rp "是否启用激进模式？激进模式会按原逻辑覆盖更多系统参数并强制使用 fq。[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && aggressive="yes" || aggressive="no"
+    relaxed="not-supported"
+    if awk "BEGIN{exit !($local_bw > 10 * $vps_bw)}"; then
+      yellow "提示：本地带宽显著高于服务器带宽，原算法提示可能导致性能问题。"
+      mystery_log "warning=local-bandwidth-significantly-exceeds-server"
+    fi
+    if awk "BEGIN{exit !($rtt > 500 && $memory < 512)}"; then
+      yellow "提示：高延迟且内存较小，原算法提示可能影响性能。"
+      mystery_log "warning=high-latency-low-memory"
+    fi
+    if awk "BEGIN{exit !($rtt > 120 && $local_bw > 5 * $vps_bw)}"; then
+      yellow "提示：高延迟场景下本地带宽过高，原算法提示可能导致缓冲区膨胀。"
+      mystery_log "warning=high-latency-buffer-bloat-risk"
+    fi
+    if awk "BEGIN{exit !($rtt > 120 && $ramp < .3)}"; then
+      yellow "提示：高延迟场景下，原算法建议使用较高曲率值以改善吞吐量。"
+      mystery_log "warning=high-latency-low-curvature"
+    fi
+    if [ "$aggressive" = "yes" ] && awk "BEGIN{exit !($memory < 512)}"; then
+      yellow "提示：内存不足 512 MB 时启用激进模式，原算法提示可能影响系统稳定性。"
+      mystery_log "warning=aggressive-low-memory"
+    fi
+  else
+    aggressive="not-supported"
+    read -rp "是否启用 Legacy 延迟宽松模式？原逻辑会将 RTT 增加 20%。[y/N]: " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+      relaxed="yes"
+      rtt="$(awk -v n="$rtt" 'BEGIN { print int(n*1.2 == int(n*1.2) ? n*1.2 : int(n*1.2)+1) }')"
+      yellow "Legacy 计算使用的 RTT 已调整为 $rtt ms。"
+    else
+      relaxed="no"
+    fi
+    yellow "Legacy 原逻辑不使用内存、曲率或激进模式输入；这些值仅记录在日志中。"
+  fi
+  mystery_log "cc=$MYSTERY_CC qdisc=$MYSTERY_QDISC local_mbps=$local_bw server_mbps=$vps_bw rtt_ms=$rtt memory_mb=$memory curvature=$ramp aggressive=$aggressive relaxed=$relaxed"
+  mystery_generate_tcp_config "$MYSTERY_ALGORITHM" "$local_bw" "$vps_bw" "$rtt" "$memory" "$ramp" "$MYSTERY_CC" "$MYSTERY_QDISC" "$aggressive" || {
+    mystery_log "result=generation-failed"
+    red "生成迷之调参配置失败。"
+    pause
+    return
+  }
+  mystery_collapse_overrides || { mystery_log "result=override-collapse-failed"; red "整理原算法覆盖参数失败。"; pause; return; }
+  {
+    printf '\n[generated-original]\n'
+    cat "$MYSTERY_CANDIDATE"
+  } >> "$MYSTERY_LOG"
+  echo
+  green "原算法完整生成结果"
+  cat "$MYSTERY_CANDIDATE"
+  mystery_filter_supported_candidate || { mystery_log "result=filter-failed"; red "过滤当前内核不支持参数时失败。"; pause; return; }
+  {
+    printf '\n[applicable-after-kernel-check]\n'
+    cat "$MYSTERY_CANDIDATE"
+  } >> "$MYSTERY_LOG"
+  echo
+  green "当前内核待应用配置预览"
+  cat "$MYSTERY_CANDIDATE"
+  echo
+  yellow "该预览为原算法完整配置，会影响内核/内存/ARP/转发等系统策略；如应用失败，将自动尝试恢复应用前基线。"
+  read -rp "确认应用以上配置并持久化？[y/N]: " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || { mystery_log "result=previewed-not-applied"; yellow "未应用配置；本次计算记录已写入 $MYSTERY_LOG。"; pause; return; }
+  if mystery_save_baseline_once && mystery_apply_candidate; then
+    mystery_log "result=applied persisted=$MYSTERY_CONF"
+    green "本次运行日志已写入 $MYSTERY_LOG"
+    yellow "公式生成配置尚未证明是本链路最优值；建议随后使用 iperf3 验证吞吐、重传和抖动。"
+  else
+    mystery_log "result=apply-failed"
+    red "迷之调参配置应用失败；检查日志 $MYSTERY_LOG。"
+  fi
+  pause
+}
+
+mystery_tune_menu(){
+  local choice
+  while true; do
+    clear_screen
+    green "调试区 - TCP 迷之调参"
+    echo "--------------------------------"
+    echo "1. 开始一次迷之调参配置生成 / 应用"
+    echo "2. 查看最近一次迷之调参运行日志"
+    echo "0. 返回主菜单"
+    echo
+    read -rp "请选择 [0-2]: " choice
+    case "$choice" in
+      1) mystery_tune_flow ;;
+      2) view_mystery_log ;;
+      0) return ;;
+      *) red "无效输入"; sleep 1 ;;
+    esac
+  done
+}
+
 tune_flow(){
   local host direction duration client_bw vps_bw rtt bottleneck bdp candidate
   local mib_value choice applied last_good="" next_step margin final_candidate command
@@ -447,6 +1411,12 @@ tune_flow(){
   echo "说明：脚本运行在 VPS；带宽与 RTT 必须对应客户端和该 VPS 的目标链路。"
   echo "公网 speedtest 的结果不会作为 BDP 输入。"
   echo
+  if [ -f "$MYSTERY_CONF" ]; then
+    red "检测到已启用的迷之调参持久化配置：$MYSTERY_CONF"
+    yellow "请先执行初始化恢复移除迷之调参配置，再使用交互实测调优流程。"
+    pause
+    return
+  fi
   require_root || { pause; return; }
   has sysctl && has awk && has iperf3 || {
     red "缺少必要命令，请先运行“环境检查 / 安装依赖”。"
@@ -982,6 +1952,12 @@ remote_tune_flow(){
   echo "说明：被调 VPS 作为控制端和发送端，通过 SSH 登录远程测试节点。"
   echo "默认推荐密钥认证；密码模式需 sshpass，密码仅在本次运行期间驻留内存。"
   echo
+  if [ -f "$MYSTERY_CONF" ]; then
+    red "检测到已启用的迷之调参持久化配置：$MYSTERY_CONF"
+    yellow "请先执行初始化恢复移除迷之调参配置，再使用远程实测调优流程。"
+    pause
+    return
+  fi
   require_root || { pause; return; }
   check_remote_local_env || { red "远程模式本机依赖未满足。"; pause; return; }
   while true; do
@@ -1114,26 +2090,37 @@ start_iperf_server(){
 menu(){
   while true; do
     clear_screen
-    green "TCP 调优管理脚本 - 文章方案一"
-    echo "--------------------------------"
-    echo "1. 环境检查 / 安装依赖"
-    echo "2. 查看当前 TCP / qdisc 状态"
-    echo "3. 手工客户端：BDP 与 iperf3 交互调优"
-    echo "4. SSH 远程节点：下载方向自动测试调优"
+    green "TCP 调优管理脚本 ${SCRIPT_VERSION} - ${SCRIPT_DATE}"
+    echo "=================================================="
+    green "[ 状态检查 / 基础工具 ]"
+    echo "1. 检查并输出当前参数 / 完整状态"
+    echo "2. 环境检查 / 安装基础依赖"
+    echo "3. 安装 / 查看 / 启用 XanMod 内核状态"
+    echo "4. 独立公网测速（Ookla / LibreSpeed）"
     echo "5. 启动 iperf3 服务端（手工模式使用）"
-    echo "6. 恢复调优前基线配置"
-    echo "7. 独立公网测速（Ookla / LibreSpeed）"
+    echo
+    green "[ 调试区 ]"
+    echo "6. 手工客户端：BDP 与 iperf3 交互调优"
+    echo "7. SSH 远程节点：下载方向自动测试调优"
+    echo "8. TCP 迷之调参 / 查看最近运行日志"
+    echo
+    green "[ 恢复 / 退出 ]"
+    echo "9. 仅恢复调优前基线配置"
+    echo "10. 一键卸载附加组件并恢复初始化状态"
     echo "0. 退出"
     echo
-    read -rp "请输入选择 [0-7]: " num
+    read -rp "请输入选择 [0-10]: " num
     case "$num" in
-      1) check_env ;;
-      2) show_status ;;
-      3) tune_flow ;;
-      4) remote_tune_flow ;;
+      1) show_status ;;
+      2) check_env ;;
+      3) install_xanmod_kernel ;;
+      4) public_speedtest_menu ;;
       5) start_iperf_server ;;
-      6) restore_baseline ;;
-      7) public_speedtest_menu ;;
+      6) tune_flow ;;
+      7) remote_tune_flow ;;
+      8) mystery_tune_menu ;;
+      9) restore_baseline ;;
+      10) reset_to_initial_state ;;
       0) exit 0 ;;
       *) red "无效输入"; sleep 1 ;;
     esac
