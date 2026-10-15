@@ -758,7 +758,7 @@ LOCK_HELD=0
 WATCHDOG_PID=""
 AT_MAX_CANDIDATES=8
 AT_DURATION=20
-AT_BUDGET_GIB=2
+AT_BUDGET_GIB=20
 BUDGET_USED_BYTES=0
 BASELINE_THROUGHPUT=0
 BASELINE_RETR=0
@@ -828,13 +828,28 @@ RESTORE_INNER
 }
 
 session_restore_runtime(){
+  # Bug-1 fix: IFS=' = ' strips spaces from multi-word values like "4096 16384 4194304".
+  # Read key and raw remainder separately with read -r key rest, then strip only the
+  # leading " = " separator, preserving internal spaces in the value.
   local snap="$SESSION_DIR/snapshot.conf"
   [ -f "$snap" ] || { red "找不到会话快照：$snap"; return 1; }
-  while IFS=' = ' read -r key value; do
-    [[ "$key" =~ ^# ]] && continue
-    [[ -z "${key// /}" ]] && continue
-    sysctl -w "${key// /}=${value// /}" >/dev/null 2>&1 || true
+  while IFS= read -r _line; do
+    [[ "$_line" =~ ^# ]] && continue
+    [[ -z "${_line// /}" ]] && continue
+    # Split on first " = " only
+    local _key _val
+    _key="${_line%% = *}"
+    _val="${_line#* = }"
+    _key="${_key// /}"  # strip spaces from key only
+    [ -z "$_key" ] && continue
+    sysctl -w "${_key}=${_val}" >/dev/null 2>&1 || true
   done < "$snap"
+  # Bug-3 fix: also restore actual egress interface qdisc when reverting
+  if [ -n "$ACTUAL_IFACE" ]; then
+    local orig_qdisc
+    orig_qdisc="$(awk '/default_qdisc/{print $NF}' "$snap" 2>/dev/null)"
+    [ -n "$orig_qdisc" ] && tc qdisc replace dev "$ACTUAL_IFACE" root "$orig_qdisc" 2>/dev/null || true
+  fi
 }
 
 session_log(){
@@ -959,8 +974,14 @@ apply_cc(){
 }
 
 apply_qdisc(){
+  # Bug-3 fix: sysctl default_qdisc only affects new interfaces; existing interfaces
+  # keep their old qdisc.  Also call `tc qdisc replace` on the actual egress interface
+  # so the test actually exercises the intended qdisc.
   local qdisc="$1"
   sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1
+  if [ -n "$ACTUAL_IFACE" ]; then
+    tc qdisc replace dev "$ACTUAL_IFACE" root "$qdisc" 2>/dev/null || true
+  fi
 }
 
 apply_wmem(){
@@ -985,9 +1006,13 @@ _at_budget_add(){
 
 run_iperf3_json(){
   # $1=target $2=direction(download|upload) $3=duration $4=parallel
+  # Direction semantics (VPS runs iperf3 -c remote):
+  #   "download" = VPS sends to remote (NO -R)  → tests VPS egress CC/wmem/qdisc
+  #   "upload"   = remote sends to VPS   (-R)   → tests VPS ingress rmem
+  # Fix-10: previously "-R" was added for "download" which was backwards.
   local target="$1" direction="${2:-download}" duration="${3:-20}" parallel="${4:-1}"
   local args=("-c" "$target" "-J" "-t" "$duration")
-  [ "$direction" = "download" ] && args+=("-R")
+  [ "$direction" = "upload" ] && args+=("-R")  # upload=VPS receives=remote sends to VPS
   [ "$parallel" -gt 1 ] && args+=("-P" "$parallel")
   local json
   json="$(iperf3 "${args[@]}" 2>/dev/null)"
@@ -1037,40 +1062,57 @@ run_diagnostic_buffer_test(){
 ##############################################################################
 
 score_candidate(){
+  # Fix-7: Use ratio-based scoring so both terms are dimensionless [0..N].
+  # tp_ratio = candidate_tp / baseline_tp  (higher is better)
+  # retr_quality = baseline_norm_retr / candidate_norm_retr, capped at 1.0.
+  #   Capping at 1.0 means "better retr than baseline" gives no bonus; only worse
+  #   retr gives demerits.  This prevents zero-retr candidates from overwhelming
+  #   the throughput component.
+  # score = tp_ratio * 0.7 + retr_quality * 0.3
+  # Baseline scores exactly 1.0 by definition.
+  #
+  # Fix-8: caller must compare CANDIDATE_SCORE against BASELINE_SCORE (1.0) and
+  #        require CANDIDATE_SCORE > BASELINE_SCORE * min_improvement_threshold.
+  #
   # $1=throughput $2=retr $3=rtt_us $4=base_tp $5=base_retr $6=base_rtt $7=base_bytes
   local tp="$1" retr="$2" rtt_us="$3"
   local base_tp="$4" base_retr="$5" base_rtt_us="$6" base_bytes="$7"
   CANDIDATE_SCORE=-1
   SCORE_REJECT_REASON=""
-  # 门槛 1：吞吐 >= 基线 95%
-  local min_tp
-  min_tp="$(awk "BEGIN{printf \"%.4f\", $base_tp * 0.95}")"
-  if awk "BEGIN{exit !($tp < $min_tp)}"; then
-    SCORE_REJECT_REASON="吞吐量低于基线 95%（${tp} < ${min_tp} Mbps）"
+  local eps=0.001
+
+  # Gate 1: throughput >= 95% of baseline
+  if awk "BEGIN{exit !($base_tp > 0 && $tp / $base_tp < 0.95)}"; then
+    SCORE_REJECT_REASON="吞吐量低于基线 95%（${tp} Mbps < ${base_tp}×0.95 Mbps）"
     return 1
   fi
-  # 归一化重传率（per GB 发送量）
-  local norm_retr base_norm_retr eps=0.001
-  norm_retr="$(awk "BEGIN{printf \"%.6f\", $retr / (${IPERF_BYTES:-1} / 1073741824.0 + $eps)}")"
+
+  # Compute normalized retransmit rates per GB sent
+  local cand_bytes="${IPERF_BYTES:-1}"
+  local norm_retr base_norm_retr
+  norm_retr="$(awk "BEGIN{printf \"%.6f\", $retr / ($cand_bytes / 1073741824.0 + $eps)}")"
   base_norm_retr="$(awk "BEGIN{printf \"%.6f\", $base_retr / ($base_bytes / 1073741824.0 + $eps)}")"
-  # 门槛 2：归一化重传率 <= 基线 3 倍（且绝对值 > 1 才检查）
+
+  # Gate 2: normalized retr <= 3× baseline (only checked when absolute rate > 1)
   if awk "BEGIN{exit !($norm_retr > $base_norm_retr * 3 && $norm_retr > 1)}"; then
     SCORE_REJECT_REASON="归一化重传率超过基线 3 倍（${norm_retr} vs ${base_norm_retr}）"
     return 1
   fi
-  # 门槛 3：满载 RTT <= 基线 200%（仅在两者均 > 0 时检查）
-  if awk "BEGIN{exit !($rtt_us > 0 && $base_rtt_us > 0)}"; then
-    local max_rtt
-    max_rtt="$(awk "BEGIN{printf \"%.0f\", $base_rtt_us * 2}")"
-    if awk "BEGIN{exit !($rtt_us > $max_rtt)}"; then
-      SCORE_REJECT_REASON="满载 RTT 超过基线 200%（${rtt_us} > ${max_rtt} us）"
-      return 1
-    fi
+
+  # Gate 3: loaded RTT <= 200% of baseline (skip when either value is unknown/zero)
+  if awk "BEGIN{exit !($rtt_us > 0 && $base_rtt_us > 0 && $rtt_us > $base_rtt_us * 2)}"; then
+    SCORE_REJECT_REASON="满载 RTT 超过基线 200%（${rtt_us} us > ${base_rtt_us}×2 us）"
+    return 1
   fi
-  # 综合评分
-  local safe_norm_retr
-  safe_norm_retr="$(awk "BEGIN{printf \"%.6f\", ($norm_retr > $eps) ? $norm_retr : $eps}")"
-  CANDIDATE_SCORE="$(awk "BEGIN{printf \"%.4f\", $tp * 0.7 + (1.0 / $safe_norm_retr) * 0.3}")"
+
+  # Ratio-based score (Fix-7)
+  local tp_ratio safe_cand_norm safe_base_norm retr_quality
+  tp_ratio="$(awk "BEGIN{printf \"%.6f\", ($base_tp > 0) ? $tp / $base_tp : 1}")"
+  safe_cand_norm="$(awk "BEGIN{printf \"%.6f\", ($norm_retr > $eps) ? $norm_retr : $eps}")"
+  safe_base_norm="$(awk "BEGIN{printf \"%.6f\", ($base_norm_retr > $eps) ? $base_norm_retr : $eps}")"
+  # retr_quality: ratio of (base_retr / cand_retr), capped at 1.0 so only degradation hurts
+  retr_quality="$(awk "BEGIN{q=$safe_base_norm/$safe_cand_norm; printf \"%.6f\", (q>1)?1:q}")"
+  CANDIDATE_SCORE="$(awk "BEGIN{printf \"%.6f\", $tp_ratio * 0.7 + $retr_quality * 0.3}")"
   return 0
 }
 
@@ -1686,6 +1728,8 @@ _at_cleanup(){
   fi
   lock_release
   [ -n "$SESSION_DIR" ] && session_log "cleanup reason=$reason"
+  # Bug-2 fix: on interrupt/term signals we must exit, not return to caller
+  case "$reason" in interrupted|cancelled) exit 1 ;; esac
 }
 
 auto_tune_flow(){
@@ -1733,14 +1777,14 @@ auto_tune_flow(){
   direction="download"
   duration="$AT_DURATION"
 
-  echo "选择测试方向："
-  echo "1. VPS -> 客户端（下载，主要场景）"
-  echo "2. 客户端 -> VPS（上传）"
+  echo "选择测试方向（影响实际 iperf3 方向和缓冲候选生成）："
+  echo "1. VPS → 远端（VPS 发送，测 VPS 出口 CC/wmem/qdisc — 代理下载主场景）"
+  echo "2. 远端 → VPS（远端发送，测 VPS 入口 rmem — 代理上传场景）"
   while true; do
     read -rp "请选择 [1-2]: " _choice
     case "$_choice" in
-      1) direction="download"; break ;;
-      2) direction="upload"; break ;;
+      1) direction="download"; break ;;  # VPS sends, no -R
+      2) direction="upload";   break ;;  # remote sends, adds -R
       *) red "请选择 1 或 2。" ;;
     esac
   done
@@ -1863,21 +1907,34 @@ auto_tune_flow(){
   fi
 
   # 4) 缓冲候选（仅在诊断确认缓冲瓶颈时）
+  # Fix-12: only change the buffer for the direction under test:
+  #   download (VPS sends) → only increase tcp_wmem max
+  #   upload   (VPS recv)  → only increase tcp_rmem max
   if [ "$BUFFER_LIMITED" -eq 1 ] && [ "$bdp" -gt 0 ]; then
-    local _cur_wmax
-    _cur_wmax="$(sysctl_value net.ipv4.tcp_wmem | awk '{print $3}')"
+    local _cur_buf_max
+    if [ "$direction" = "upload" ]; then
+      _cur_buf_max="$(sysctl_value net.ipv4.tcp_rmem | awk '{print $3}')"
+    else
+      _cur_buf_max="$(sysctl_value net.ipv4.tcp_wmem | awk '{print $3}')"
+    fi
     for _factor in 1.5 2 4; do
       [ "$cand_count" -ge "$AT_MAX_CANDIDATES" ] && break
       local _new_max
       _new_max="$(awk "BEGIN{printf \"%.0f\", $bdp * $_factor}")"
       [ "$_new_max" -gt "$mem_budget_bytes" ] && _new_max="$mem_budget_bytes"
       # 只在新值大于当前值时生成候选
-      awk "BEGIN{exit !($_new_max > ${_cur_wmax:-0})}" || continue
+      awk "BEGIN{exit !($_new_max > ${_cur_buf_max:-0})}" || continue
       CAND_CC[$cand_count]="$current_cc"
       CAND_QDISC[$cand_count]="$current_qdisc"
-      CAND_WMEM[$cand_count]="$_new_max"
-      CAND_RMEM[$cand_count]="$_new_max"
-      CAND_LABEL[$cand_count]="wmem/rmem_max=${_new_max}(BDP×${_factor})"
+      if [ "$direction" = "upload" ]; then
+        CAND_WMEM[$cand_count]=""
+        CAND_RMEM[$cand_count]="$_new_max"
+        CAND_LABEL[$cand_count]="rmem_max=${_new_max}(BDP×${_factor})"
+      else
+        CAND_WMEM[$cand_count]="$_new_max"
+        CAND_RMEM[$cand_count]=""
+        CAND_LABEL[$cand_count]="wmem_max=${_new_max}(BDP×${_factor})"
+      fi
       cand_count=$((cand_count + 1))
     done
   fi
@@ -1934,8 +1991,8 @@ auto_tune_flow(){
       RES_STATUS[$i]="pass"
       printf '  吞吐: %s Mbps，Retr: %s，RTT: %s us，得分: %s\n' \
         "${RES_TP[$i]}" "${RES_RETR[$i]}" "${RES_RTT[$i]}" "$CANDIDATE_SCORE"
-      # 超过当前最佳 5% 才替换（防止微小差异导致不必要变更）
-      if awk "BEGIN{exit !(${CANDIDATE_SCORE} > ${best_score_val} * 1.05 || $best_idx == -1)}"; then
+      # Fix-8: candidate must beat baseline_score; use 5% margin between candidates
+      if awk "BEGIN{exit !($CANDIDATE_SCORE > $baseline_score && ($CANDIDATE_SCORE > ${best_score_val} * 1.05 || $best_idx == -1))}"; then
         best_score_val="$CANDIDATE_SCORE"
         best_idx="$i"
       fi
@@ -1962,16 +2019,18 @@ auto_tune_flow(){
   green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
   session_log "best_candidate=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
 
-  # 最终验收测试（40% 预算，-P 4 并发，时长 2× duration）
+  # 最终验收测试（40% 预算，单流，时长 2× duration，与筛选保持相同并发数）
   echo
-  green "--- 最终验收测试（-P 4 并发，时长 $((duration * 2)) 秒）---"
+  green "--- 最终验收测试（单流，时长 $((duration * 2)) 秒）---"
   apply_cc "${CAND_CC[$best_idx]}"
   apply_qdisc "${CAND_QDISC[$best_idx]}"
   [ -n "${CAND_WMEM[$best_idx]}" ] && apply_wmem "${CAND_WMEM[$best_idx]}"
   [ -n "${CAND_RMEM[$best_idx]}" ] && apply_rmem "${CAND_RMEM[$best_idx]}"
 
   local final_ok=0
-  if run_iperf3_json "$target" "$direction" "$((duration * 2))" 4; then
+  # Fix-11: use same parallelism (1) as screening; 4-stream naturally yields higher
+  #         throughput and cannot be directly compared to single-stream baseline.
+  if run_iperf3_json "$target" "$direction" "$((duration * 2))" 1; then
     if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
         "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
       green "验收通过：吞吐 $IPERF_THROUGHPUT Mbps，Retr=$IPERF_RETR，RTT=${IPERF_RTT}us，得分=$CANDIDATE_SCORE"
@@ -1992,11 +2051,18 @@ auto_tune_flow(){
     _at_cleanup failed_acceptance; trap - INT TERM EXIT; pause; return
   fi
 
+  # Bug-5 fix: run optional proxy acceptance BEFORE persisting; failure blocks commit
+  if ! proxy_acceptance_test; then
+    yellow "代理验收失败，取消持久化，恢复到调优前状态。"
+    session_restore_runtime
+    _at_cleanup failed_proxy_acceptance; trap - INT TERM EXIT; pause; return
+  fi
+
   # 原子持久化
   if persist_final_atomic "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
       "${CAND_WMEM[$best_idx]}" "${CAND_RMEM[$best_idx]}"; then
-    # 持久化成功，删除 watchdog 恢复脚本
-    rm -f "$SESSION_DIR/restore.sh"
+    # Bug-4 fix: keep restore.sh for rollback; just mark it as a post-persist snapshot
+    # (watchdog already stopped, so the file won't trigger auto-restore on clean exit)
     session_log "persisted=yes"
 
     echo
@@ -2015,7 +2081,6 @@ auto_tune_flow(){
     yellow "如需回滚，执行：bash $SESSION_DIR/restore.sh"
     printf '会话日志：%s/session.log\n' "$SESSION_DIR"
     printf '测试记录：%s/results.tsv\n' "$SESSION_DIR"
-    proxy_acceptance_test
     _at_cleanup success; trap - INT TERM EXIT
   else
     red "持久化失败，已自动恢复。"
@@ -2431,6 +2496,8 @@ _rat_cleanup(){
   clear_remote_credentials
   lock_release
   [ -n "$SESSION_DIR" ] && session_log "remote_cleanup reason=$reason"
+  # Bug-2 fix: exit on interrupt/term signals
+  case "$reason" in interrupted|cancelled) exit 1 ;; esac
 }
 
 remote_auto_tune_flow(){
@@ -2532,19 +2599,35 @@ remote_auto_tune_flow(){
   current_qdisc="$(sysctl_value net.core.default_qdisc)"
   available_cc="$(sysctl_value net.ipv4.tcp_available_congestion_control)"
 
-  # 基线测试（通过主节点）
-  green "--- 基线测试（主节点 ${NODE_LABEL[$primary]}）---"
-  if ! _remote_run_one_test "$primary" "$target" "$direction" "$duration" 1; then
-    red "基线测试失败。"
-    _rat_cleanup failed_baseline; trap - INT TERM EXIT; pause; return
-  fi
-  BASELINE_THROUGHPUT="$IPERF_THROUGHPUT"
-  BASELINE_RETR="$IPERF_RETR"
-  BASELINE_RTT="$IPERF_RTT"
-  BASELINE_BYTES="$(awk "BEGIN{printf \"%.0f\", $BASELINE_THROUGHPUT * 1000000 / 8 * $duration + 1}")"
-  printf '基线：吞吐 %s Mbps，Retr=%s，RTT=%s us\n' \
-    "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT"
-  session_log "baseline tp=${BASELINE_THROUGHPUT}Mbps retr=$BASELINE_RETR"
+  # Fix-9: Run baseline for EVERY node; each node is scored against its own baseline.
+  # (Primary node baseline also sets BASELINE_THROUGHPUT for BDP/diagnostic use.)
+  declare -a NODE_BL_TP NODE_BL_RETR NODE_BL_RTT NODE_BL_BYTES NODE_BL_SCORE
+  green "--- 基线测试（${NODE_COUNT} 个节点）---"
+  local _ni
+  for (( _ni=0; _ni<NODE_COUNT; _ni++ )); do
+    printf '节点 %s 基线测试...\n' "${NODE_LABEL[$_ni]}"
+    if _remote_run_one_test "$_ni" "$target" "$direction" "$duration" 1; then
+      NODE_BL_TP[$_ni]="$IPERF_THROUGHPUT"
+      NODE_BL_RETR[$_ni]="$IPERF_RETR"
+      NODE_BL_RTT[$_ni]="$IPERF_RTT"
+      NODE_BL_BYTES[$_ni]="$(awk "BEGIN{printf \"%.0f\", $IPERF_THROUGHPUT * 1000000 / 8 * $duration + 1}")"
+    else
+      red "  节点 ${NODE_LABEL[$_ni]} 基线测试失败，标记为未知。"
+      # Keep zeros — node will always fail scoring (round_ok=0)
+      NODE_BL_TP[$_ni]="0"; NODE_BL_RETR[$_ni]="0"
+      NODE_BL_RTT[$_ni]="0"; NODE_BL_BYTES[$_ni]="1"
+    fi
+    # Baseline score is 1.0 by definition (self vs self)
+    NODE_BL_SCORE[$_ni]="1.000000"
+    printf '  吞吐: %s Mbps，Retr: %s，RTT: %s us\n' \
+      "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}"
+  done
+  # Primary baseline also exported for BDP / legacy diagnostics
+  BASELINE_THROUGHPUT="${NODE_BL_TP[$primary]}"
+  BASELINE_RETR="${NODE_BL_RETR[$primary]}"
+  BASELINE_RTT="${NODE_BL_RTT[$primary]}"
+  BASELINE_BYTES="${NODE_BL_BYTES[$primary]}"
+  session_log "baseline primary=${NODE_LABEL[$primary]} tp=${BASELINE_THROUGHPUT}Mbps retr=$BASELINE_RETR"
 
   # 诊断性缓冲测试（通过主节点，单流 vs 并发）
   BUFFER_LIMITED=0
@@ -2594,17 +2677,26 @@ remote_auto_tune_flow(){
   fi
 
   if [ "$BUFFER_LIMITED" -eq 1 ] && [ "$bdp" -gt 0 ]; then
-    local _cur_wmax
-    _cur_wmax="$(sysctl_value net.ipv4.tcp_wmem | awk '{print $3}')"
+    local _cur_buf_max
+    if [ "$direction" = "upload" ]; then
+      _cur_buf_max="$(sysctl_value net.ipv4.tcp_rmem | awk '{print $3}')"
+    else
+      _cur_buf_max="$(sysctl_value net.ipv4.tcp_wmem | awk '{print $3}')"
+    fi
     for _factor in 1.5 2 4; do
       [ "$cand_count" -ge "$AT_MAX_CANDIDATES" ] && break
       local _new_max
       _new_max="$(awk "BEGIN{printf \"%.0f\", $bdp * $_factor}")"
       [ "$_new_max" -gt "$mem_budget_bytes" ] && _new_max="$mem_budget_bytes"
-      awk "BEGIN{exit !($_new_max > ${_cur_wmax:-0})}" || continue
+      awk "BEGIN{exit !($_new_max > ${_cur_buf_max:-0})}" || continue
       CAND_CC[$cand_count]="$current_cc"; CAND_QDISC[$cand_count]="$current_qdisc"
-      CAND_WMEM[$cand_count]="$_new_max"; CAND_RMEM[$cand_count]="$_new_max"
-      CAND_LABEL[$cand_count]="wmem/rmem_max=${_new_max}(BDP×${_factor})"
+      if [ "$direction" = "upload" ]; then
+        CAND_WMEM[$cand_count]=""; CAND_RMEM[$cand_count]="$_new_max"
+        CAND_LABEL[$cand_count]="rmem_max=${_new_max}(BDP×${_factor})"
+      else
+        CAND_WMEM[$cand_count]="$_new_max"; CAND_RMEM[$cand_count]=""
+        CAND_LABEL[$cand_count]="wmem_max=${_new_max}(BDP×${_factor})"
+      fi
       cand_count=$((cand_count + 1))
     done
   fi
@@ -2616,9 +2708,11 @@ remote_auto_tune_flow(){
     _rat_cleanup success_no_change; trap - INT TERM EXIT; pause; return
   fi
 
-  # 候选筛选（所有节点通过才算通过）
+  # 候选筛选（所有节点通过才算通过，每节点对照自身基线）
   declare -a RES_SCORE RES_TP RES_RETR RES_RTT RES_STATUS
   local best_idx=-1 best_score_val="-1"
+  # Fix-9: baseline_score = 1.0 for all nodes by definition
+  local node_baseline_score="1.000000"
 
   echo
   green "--- 候选筛选（$NODE_COUNT 个节点，预算 60%）---"
@@ -2639,8 +2733,13 @@ remote_auto_tune_flow(){
       fi
       printf '  节点 %s: 吞吐 %s Mbps，Retr=%s，RTT=%s us\n' \
         "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT"
+      # Fix-9: score against this node's own baseline, not primary's
+      if [ "${NODE_BL_TP[$_ni]:-0}" -eq 0 ]; then
+        printf '  节点 %s 基线未知，跳过评分。\n' "${NODE_LABEL[$_ni]}"
+        round_ok=0; continue
+      fi
       if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-          "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+          "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}"; then
         awk "BEGIN{exit !($CANDIDATE_SCORE < $worst_score)}" && worst_score="$CANDIDATE_SCORE"
       else
         printf '  节点 %s 拒绝：%s\n' "${NODE_LABEL[$_ni]}" "$SCORE_REJECT_REASON"
@@ -2648,7 +2747,9 @@ remote_auto_tune_flow(){
       fi
     done
 
-    if [ "$round_ok" -eq 1 ] && awk "BEGIN{exit !($worst_score > $best_score_val * 1.05 || $best_idx == -1)}"; then
+    # Fix-8 + Fix-9: candidate must beat baseline (1.0) across all nodes
+    if [ "$round_ok" -eq 1 ] && \
+       awk "BEGIN{exit !($worst_score > $node_baseline_score && ($worst_score > ${best_score_val} * 1.05 || $best_idx == -1))}"; then
       RES_SCORE[$i]="$worst_score"
       RES_STATUS[$i]="pass"
       best_score_val="$worst_score"
@@ -2673,9 +2774,9 @@ remote_auto_tune_flow(){
   green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
   session_log "best=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
 
-  # 最终验收（所有节点，-P 4，时长 2×）
+  # 最终验收（所有节点，单流，时长 2× — Fix-11: same parallelism as screening）
   echo
-  green "--- 最终验收测试（所有 $NODE_COUNT 节点，-P 4，时长 $((duration * 2)) 秒）---"
+  green "--- 最终验收测试（所有 $NODE_COUNT 节点，单流，时长 $((duration * 2)) 秒）---"
   apply_cc "${CAND_CC[$best_idx]}"
   apply_qdisc "${CAND_QDISC[$best_idx]}"
   [ -n "${CAND_WMEM[$best_idx]}" ] && apply_wmem "${CAND_WMEM[$best_idx]}"
@@ -2683,12 +2784,18 @@ remote_auto_tune_flow(){
 
   local final_ok=1
   for (( _ni=0; _ni<NODE_COUNT; _ni++ )); do
-    if ! _remote_run_one_test "$_ni" "$target" "$direction" "$((duration * 2))" 4; then
+    # Fix-11: use same parallelism (1) as screening; 4-stream would inflate throughput
+    if ! _remote_run_one_test "$_ni" "$target" "$direction" "$((duration * 2))" 1; then
       red "节点 ${NODE_LABEL[$_ni]} 验收测试失败。"
       final_ok=0; continue
     fi
+    # Fix-9: score against each node's own baseline
+    if [ "${NODE_BL_TP[$_ni]:-0}" -eq 0 ]; then
+      red "节点 ${NODE_LABEL[$_ni]} 基线未知，验收失败。"
+      final_ok=0; continue
+    fi
     if ! score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+        "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}"; then
       red "节点 ${NODE_LABEL[$_ni]} 验收未通过：$SCORE_REJECT_REASON"
       final_ok=0
     else
@@ -2706,9 +2813,16 @@ remote_auto_tune_flow(){
 
   clear_remote_credentials
 
+  # Bug-5 fix: proxy acceptance before persist
+  if ! proxy_acceptance_test; then
+    yellow "代理验收失败，取消持久化，恢复到调优前状态。"
+    session_restore_runtime
+    _rat_cleanup failed_proxy_acceptance; trap - INT TERM EXIT; pause; return
+  fi
+
   if persist_final_atomic "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
       "${CAND_WMEM[$best_idx]}" "${CAND_RMEM[$best_idx]}"; then
-    rm -f "$SESSION_DIR/restore.sh"
+    # Bug-4 fix: keep restore.sh for rollback
     session_log "persisted=yes"
     echo
     green "=== 调优前后对比 ==="
@@ -2719,7 +2833,6 @@ remote_auto_tune_flow(){
       "$(awk '/default_qdisc/{print $NF}' "$SESSION_DIR/snapshot.conf")" \
       "${CAND_QDISC[$best_idx]}"
     yellow "如需回滚：bash $SESSION_DIR/restore.sh"
-    proxy_acceptance_test
     _rat_cleanup success; trap - INT TERM EXIT
   else
     red "持久化失败，已自动恢复。"
@@ -2837,10 +2950,11 @@ menu(){
 #   PROXY_TEST_URL=<受控测试目标 URL>
 
 proxy_acceptance_test(){
+  # Bug-5 fix: returns 0 when skipped or passed, 1 when configured and failed.
   local proxy_host="${PROXY_HOST:-}" proxy_port="${PROXY_PORT:-1080}"
   local test_url="${PROXY_TEST_URL:-}"
   if [ -z "$proxy_host" ] || [ -z "$test_url" ]; then
-    return 0
+    return 0  # not configured; skip
   fi
   if ! has curl; then
     yellow "未找到 curl，跳过代理验收测试。"
@@ -2860,13 +2974,15 @@ proxy_acceptance_test(){
   throughput_mbps="$(awk "BEGIN{printf \"%.2f\", $bytes_dl * 8 / $elapsed / 1000000}")"
   printf 'HTTP 状态: %s，下载 %s 字节，耗时 %ss，吞吐约 %s Mbps\n' \
     "$http_code" "$bytes_dl" "$elapsed" "$throughput_mbps"
-  if [ "$http_code" = "200" ] && [ "${bytes_dl:-0}" -gt 0 ]; then
-    green "代理验收测试通过。"
-  else
-    yellow "代理验收测试：HTTP $http_code，请手动核查代理是否正常工作。"
-  fi
   rm -f "$tmpfile"
   [ -n "$SESSION_DIR" ] && session_log "proxy_test host=${proxy_host} port=${proxy_port} url=${test_url} http=${http_code}"
+  if [ "$http_code" = "200" ] && [ "${bytes_dl:-0}" -gt 0 ]; then
+    green "代理验收测试通过。"
+    return 0
+  else
+    red "代理验收测试失败：HTTP ${http_code:-无响应}。"
+    return 1
+  fi
 }
 
 ##############################################################################
