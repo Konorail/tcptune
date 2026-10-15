@@ -116,7 +116,8 @@ proxy_probe(){
       printf '206 100000 1.0\n'
     else
       if [ -f "$CASE_TMP/probe-count" ]; then read -r count < "$CASE_TMP/probe-count"; fi
-      printf '%s\n' "$((count+1))" > "$CASE_TMP/probe-count"
+      printf '%s\n' "$((count+1))" > "$CASE_TMP/probe-count.next"
+      mv "$CASE_TMP/probe-count.next" "$CASE_TMP/probe-count"
       printf '200 1024 0.020\n'
     fi
   }
