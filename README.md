@@ -1,164 +1,222 @@
 # tcptune
 
-面向 VLESS/Xray 等代理 VPS 的 Linux TCP 自动调优脚本（v2.0）。
+面向代理 VPS 的保守 TCP 参数试验工具，v2.1。适用于实际使用 Linux TCP socket 的链路；VLESS 的名称本身不代表传输方式，用户态 QUIC 拥塞控制不属于本工具的调优范围。
 
-## 功能
+在指定路径、速率、时间和流量预算内寻找**足够好的配置**。原配置始终参与对照，证据不足就 `no_change`，不宣称全局最优或保证提速。
 
-- **完全非交互式**自动调优：一条命令完成全流程
-- 自动生成候选配置（CC 算法 / qdisc / 缓冲），自动测试并选出最佳方案
-- **交错复测**（≥3 轮基线/候选交替测量），用中位数判断，避免单次网络抖动左右结果
-- 可靠改善判定：吞吐提升 ≥5%，或负载下 RTT 降低 ≥20%（吞吐保持 ≥95%）
-- 每次运行创建独立会话快照，支持精确回滚
-- 进程锁 + watchdog 守护进程，中断/被杀时自动恢复原状态
-- 原子持久化：写入临时文件 → mv 替换 → sysctl --system → 逐项读回核对
-- 诊断性缓冲测试（单流 vs 并发），有瓶颈证据时才生成缓冲候选
-- 可选 SOCKS5 代理验收测试（持久化前执行）
-- 明确的退出码：0=committed，1=failed，2=no_change
-- 保留 BBR / XanMod 安装、状态检查等原有功能；迷之调参（已废弃）
+## 当前自动调优范围
 
-已知支持：Debian、Ubuntu、Kali Linux
+- 对本机作为发送端的路径，比较当前已加载的 `bbr` / `cubic`。
+- 内核 socket 诊断显示发送缓冲受限时，有限地增加 `tcp_wmem` 上限，保留原 min/default。候选同时受可用内存、cgroup v2 余量、预计并发和单连接上限约束。
+- 保持实际 qdisc 和默认 qdisc 原样。仅记录队列名称无法准确恢复选项、整棵队列或重启配置，因此本版停止自动替换队列。
+- 接收方向保留测量，但没有对端证据时跳过接收缓冲扩容，也不比较不能作用于远端发送者的本机 CC。`no_change` 是合理结果。
+- SSH 多节点自动提交暂时关闭，避免旧分支绕过统一验收。可以分别指定不同目标运行单节点流程。
 
----
+原有环境检查、状态、内核安装等菜单仍保留；自动调优流程不安装内核。废弃的“迷之调参”不进入自动流程。
 
-## 快速开始
+## 运行
+
+Linux 上需要 Bash 4.3+、jq 1.6+、iperf3、iproute2、procps、GNU coreutils 和 util-linux。SOCKS5 探针还需要 curl；本地桥接/HTTP 测试端需要 Python 3。自动调优和恢复需要 root。
 
 ```bash
-# 下载脚本
-curl -LO https://raw.githubusercontent.com/Konorail/tcptune/main/tcptune.sh
+sudo apt-get update
+sudo apt-get install -y iperf3 jq iproute2 procps coreutils util-linux curl
 
-# 非交互式自动调优（需要 root）
-sudo bash tcptune.sh --auto-tune --target <iperf3测试节点IP> --direction download
+# 可选：若当前尚未加载 BBR，先加载发行版已有模块，再建立基线。
+sudo modprobe tcp_bbr
+
+# 首轮先临时测试，结束后验证恢复。
+sudo bash tcptune.sh --auto-tune --target PEER_IP \
+  --direction download --no-persist \
+  --duration 10 --retest-rounds 5 --accept-rounds 3 \
+  --rate-mbps 1000 --budget-gib 32 --max-seconds 1800
+
+# 确认实测和回滚后，去掉 --no-persist 才会在验收通过时持久化。
 ```
 
-退出码含义：
-| 退出码 | 含义 |
-|--------|------|
-| `0` | `committed` — 检测到可靠改善，已验证并持久化 |
-| `1` | `failed` — 执行失败（已恢复原状态） |
-| `2` | `no_change` — 原配置最好或收益不足，保持不变 |
+`--direction download` 是兼容名称，明确表示 **VPS 发送到测试节点**；`upload` 表示节点发送到 VPS（iperf3 `-R`）。A→B 测试不能单独证明国内客户端→A 的体验。
 
----
+没有指定 `--auto-tune` 时进入菜单。参数顺序无关，缺失值、未知参数和非法阈值快速失败。循环地址仅允许临时测试。
 
-## CLI 参数
+| 退出码 | RESULT | 含义 |
+| --- | --- | --- |
+| 0 | committed | 新数据验收通过，已应用并写入配置 |
+| 1 | failed | 执行失败；以 `restore_verified` 判断是否确认恢复 |
+| 2 | no_change | 无候选、收益不足、波动大或预算不足，已恢复 |
+| 3 | validated | 临时模式确认候选，结束后已恢复，没有持久化 |
 
-```
-bash tcptune.sh [选项]
+`RESULT`、`REASON` 和 `REPORT` 打印到终端。快照创建之前的失败可能只有 RESULT/REASON。恢复失败一律 `failed`，并阻止下一轮把未恢复状态作为新基线。
 
-  --auto-tune          非交互式自动调优（必须配合 --target）
-  --target <host>      iperf3 测试目标 IP/域名（自动模式必须）
-  --direction <d>      测试方向：download（默认，VPS 发送）或 upload（VPS 接收）
-  --max-candidates N   最大候选数（默认 8）
-  --duration N         每轮测试时长秒（默认 20）
-  --budget-gib N       总流量预算 GiB（默认 20）
-  --retest-rounds N    交错复测轮数（默认 3）
-  --help               显示帮助
-```
+## 决策算法
 
----
+1. 取得原始参数、实际路由接口、完整 qdisc JSON 和持久化文件快照。
+2. 测量基线，生成有限候选；每个候选都从原始快照开始，应用并逐项读回后才允许测速。
+3. 初筛先过全部硬门槛，再按吞吐比值排序，最多转交三个候选。
+4. 默认五对复测，顺序交替 AB / BA，数量差不超过一。每一对计算相对变化，再汇总收益中位数。
+5. 至少 80% 的有效配对收益方向一致；中位收益需达到 `max(最低收益, 2×基线相对 MAD)`。
+6. 选择第一个满足要求的候选，再用全新的三对数据独立验收。独立验收失败就停止，不反复试到碰巧通过。
+7. 最后重新应用、读回核对，然后临时恢复或原子写入配置。
 
-## 完整自动运行示例
+配对的任何硬门槛失败都会否决该候选，不能用总体平均值覆盖。测量失败的配对保留记录；本阶段需要完整取得请求的有效配对，至少三对。默认不增加补测轮数，以免选择性丢弃失败样本。
+
+MAD 和 80% 一致性规则都是保守的**启发式策略**，小样本、MAD=0 均不构成统计显著性证明；默认值需要通过实际线路校准。
+
+配置了探针时，收益优先比较**真实代理下载吞吐和负载小请求 P95**；否则比较 iperf 吞吐和发送者平均 TCP RTT，并标明代理体验未验证。iperf 和代理链路均受退化保护，未知指标保留 `null`，不以 0 代替。
+
+| 策略环境变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `AT_MIN_TP_GAIN` | 5 | 最低吞吐收益百分比 |
+| `AT_MIN_RTT_GAIN` | 20 | 最低延迟改善百分比 |
+| `AT_MAX_RTT_FACTOR` | 115 | 相对延迟保护线，百分比 |
+| `AT_RTT_TOLERANCE_MS` | 5 | 绝对延迟容差，毫秒 |
+| `AT_MAX_RETR_FACTOR` | 300 | 每 GiB 重传相对保护线，百分比 |
+| `AT_RETR_FLOOR` | 100 | 零/小基线的绝对容差，次/GiB |
+
+延迟上限是 `max(基线×1.15, 基线+5ms)`，TCP RTT 和代理 P95 都检查。任一配对吞吐低于基线 95%、重传明显超过容差或代理出现错误时拒绝；这些保护线先于收益判断。
+
+缓冲证据来自测试连接 `ss -tinm` 的 `sndbuf_limited`：样本至少已发送 1 MiB，且显示受限时间不低于 5%。无法取得该信息时跳过。多流比单流快、BDP 大、接收窗口受限，都不能单独证明本机缓冲不足。
+
+## 参数与预算
+
+`bash tcptune.sh --help` 显示完整参数。
+
+| 参数 | 默认值 |
+| --- | --- |
+| `--duration` | 每次 10 秒，允许 2..120 |
+| `--retest-rounds` | 5 对，允许 3..15 |
+| `--accept-rounds` | 新数据 3 对，允许 3..15 |
+| `--max-candidates` | 4，最多 16 |
+| `--rate-mbps` | 每流 1000 Mbps 的测试速率上限 |
+| `--budget-gib` | 32 GiB 应用层载荷预算 |
+| `--max-seconds` | 1800 秒会话预算 |
+| `--expected-connections` | 64 个并发连接用于缓冲内存预算 |
+| `--buffer-max-mib` | 16 MiB 单连接发送缓冲候选上限 |
+
+一条成功候选在默认设置下至少需 18 次 iperf 测量：基线、初筛、十次复测、六次独立验收。1 Gbps 持续传输约需 21 GiB，再加其他候选和代理流量。因此默认预算从旧版 20 调整为 32 GiB；运行开始会打印预算。可显式降低预算或速率进行流程验证，之后再按实际带宽提高速率。
+
+所有测试共用时间和载荷账本。运行前按时长、速率上限和 10% 余量预留，成功后换成实际传输字节；失败保留预留值。探针也预留并记账。预算不足不开始下一次测量，测试进程受 timeout 限制。
+
+这是保守的**应用层载荷记账**，不包含所有 TCP/IP 包头、ACK、SSH 控制流量，不能当作运营商计费流量或严格线速硬上限。外部探针必须遵守自己的响应大小、请求数和超时约定；脚本无法强制约束任意外部程序的实际网络行为。
+
+## 真实代理探针
+
+可用内置 SOCKS5 探针，或 `--probe-command /absolute/path/to/executable` 接入实际客户端。每次 iperf 测量期间执行探针，同时大文件传输与小请求，并取得至少十个有负载的小请求样本。传输过快、样本不足时失败，增大受控文件/允许传输量后重新运行，不能将空数据当成功。
 
 ```bash
-# 基础用法：指定 iperf3 测试节点
-sudo bash tcptune.sh \
-  --auto-tune \
-  --target 203.0.113.10 \
-  --direction download \
-  --duration 20 \
-  --budget-gib 20
+sudo env PROXY_HOST=127.0.0.1 PROXY_PORT=1080 \
+  PROXY_TEST_URL=http://ORIGIN_IP:8080/bulk \
+  PROXY_SMALL_URL=http://ORIGIN_IP:8080/small \
+  PROXY_MAX_BYTES=268435456 \
+  bash tcptune.sh --auto-tune --target PEER_IP --no-persist
 ```
+
+以上探针在运行脚本的机器上测量，**不能冒充国内客户端体验**。真实客户端应通过以下桥接或远程回调执行探针。
+
+`--probe-command` 只接受可执行文件路径，不使用 eval。程序标准输出须是单个 JSON：
+
+```json
+{"status":"ok","requests":20,"errors":0,"p50_ms":80,"p95_ms":120,"download_mbps":90,"bytes":33554432}
+```
+
+`bytes` 包括大传输及所有小请求收到的字节，须为正整数，且不能超过声明的探针预算。缺失、非零退出码、超时、非法 JSON 均失败。
+
+代理服务的监听 socket 可能保留原 CC，应用自身也可能设置 socket 级 CC。需要重建监听 socket 时，显式使用 `--proxy-service xray.service`：允许工具在应用及恢复参数时重启该服务，**会中断代理连接**。未指定时不会重启服务，报告 `listener_refresh=not_managed`。应用自身设置的 CC 仍可能覆盖系统默认，应结合实际连接诊断确认。
+
+## 两台 VPS + 真实客户端
+
+```text
+国内电脑/手机（平时线路与代理客户端） ⇄ A（境外代理/被调） ⇄ B（境外受控目标）
+```
+
+A 选实际打算使用的代理 VPS，B 具备稳定带宽和 CPU 余量。两台境外 VPS 即可；国内电脑/手机承担真实接入测试，不需要另购国内 VPS。先验证一个代表性场景，再对不同时段或路径复核。
+
+在 B 启动测试端，端口只按你的测试来源开放：
 
 ```bash
-# 带代理验收（通过 SOCKS5 代理下载测试文件，在持久化前执行）
-PROXY_HOST=127.0.0.1 \
-PROXY_PORT=1080 \
-PROXY_TEST_URL=https://example.com/100mb.bin \
-sudo -E bash tcptune.sh \
-  --auto-tune \
-  --target 203.0.113.10 \
-  --direction download
+iperf3 -s
+python3 tools/lab_origin.py --bind 0.0.0.0 --port 8080 --size-mib 256
 ```
 
-> **注意**：代理验收通过 VPS 本机 curl 验证，目前不从远端客户端测量。
-> 未配置时，报告会注明"真实代理体验未验证"。
+两条命令分别在终端运行。HTTP 端按需生成有界数据，支持 Range，没有磁盘大文件和压缩优化。
 
----
+真实客户端运行 `tools/client_probe.sh`，它只加载测量函数，不改客户端 sysctl。本地需要 Bash、curl、jq。
 
-## 调优流程
-
-```
-环境检查 → 创建会话快照 → 获取进程锁 → 启动 watchdog
-→ 基线 iperf3 测试（单流）→ 诊断缓冲瓶颈（单流 vs 并发）
-→ 生成候选（CC / qdisc / 缓冲，≤8 个）
-→ 逐一临时应用候选 → 单流测试 → 评分筛选（60% 预算）
-→ 交错复测胜者（≥3 轮，比较中位数）
-→ is_reliable_improvement 判定（吞吐+RTT 双维度）
-→ 重新应用胜者 → 可选代理验收
-→ 原子持久化 + 读回核对
-→ 输出前后对比 + 回滚命令
-→ 打印 RESULT=committed|no_change|failed
-```
-
-选优策略（可通过环境变量调整）：
-
-| 策略参数 | 默认值 | 说明 |
-|----------|--------|------|
-| `AT_MIN_TP_GAIN` | `5` | 吞吐提升阈值（%） |
-| `AT_MIN_RTT_GAIN` | `20` | RTT 改善阈值（%，当吞吐≥95%时） |
-| `AT_MAX_RTT_FACTOR` | `200` | RTT 退化上限（%） |
-| `AT_MAX_RETR_FACTOR` | `300` | 归一化重传率退化上限（%） |
-
----
-
-## 回滚
-
-每次调优后会话目录保存在 `/var/lib/tcptune/sessions/`，最新会话通过 symlink `latest` 指向：
+Windows/家庭网络无需开放入站 SSH：`tools/probe_bridge.py` 在客户端监听 127.0.0.1，通过客户端主动建立的 SSH 反向转发，让 A 同步请求客户端测量。
 
 ```bash
-# 查看最新会话
-ls -la /var/lib/tcptune/sessions/latest/
+# 客户端终端 1；Windows 可给 --bash 指定 Git Bash 的完整路径。
+export PROXY_HOST=127.0.0.1 PROXY_PORT=1080
+export PROXY_TEST_URL=http://B_IP:8080/bulk
+export PROXY_SMALL_URL=http://B_IP:8080/small
+export PROXY_MAX_BYTES=268435456 PROXY_REQUESTS=20 PROXY_DURATION=10
+python3 tools/probe_bridge.py --token-file probe.token --port 19090 --timeout 15
 
-# 立即回滚到本次调优前状态
-bash /var/lib/tcptune/sessions/latest/restore.sh
-
-# 查看测试记录
-cat /var/lib/tcptune/sessions/latest/results.tsv
+# 客户端终端 2；使用已配置的 SSH 别名/密钥。
+scp probe.token vps-a:/root/tcptune/probe.token
+ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:19090:127.0.0.1:19090 vps-a
 ```
 
-回滚脚本会：
-1. 逐行恢复所有受管 sysctl 参数
-2. 恢复出口接口实际 qdisc（若本次修改过）
-3. 删除持久化配置文件（若原先不存在）或恢复原内容
+在 A 创建回调：
 
----
-
-## 依赖
-
-- `bash` ≥ 4.3
-- `sysctl`, `awk`, `iperf3`, `tc`, `ip`, `jq`, `curl`（代理验收可选）
-- root 权限
-
-安装依赖（Debian/Ubuntu）：
 ```bash
-apt-get install -y iproute2 iperf3 jq
+cd /root/tcptune
+read -r token < probe.token
+printf 'Authorization: Bearer %s\n' "$token" > probe.header
+chmod 600 probe.header probe.token
+cat > client-hook.sh <<'HOOK'
+#!/usr/bin/env bash
+exec curl -fsS --max-time 15 -X POST --header @/root/tcptune/probe.header \
+  http://127.0.0.1:19090/probe
+HOOK
+chmod 700 client-hook.sh
+
+# 两边的 PROXY_MAX_BYTES / PROXY_REQUESTS 须一致。
+sudo env PROXY_MAX_BYTES=268435456 PROXY_REQUESTS=20 \
+  bash tcptune.sh --auto-tune --target B_IP --no-persist \
+  --probe-command /root/tcptune/client-hook.sh \
+  --proxy-service xray.service --duration 10 --budget-gib 32
 ```
 
----
+代理路径必须实际经过 A；桥接脚本本身不创建代理或修改路由。先确认客户端探针能独立返回有效数据，再开始调优。桥接默认仅监听回环地址、校验 token，只能执行预配置探针，不能通过 HTTP 提交任意命令。
 
-## 回归测试
+第一轮验证应用、报告与恢复；第二轮按带宽预算运行完整 A/B 与代理验收；最后在另一时段复核，才测试持久化。
+
+## 会话、持久化和恢复
+
+`/var/lib/tcptune/sessions/<UTC时间.随机后缀>/` 保存：
+
+- 原始 sysctl、qdisc JSON、原配置及独立 `restore.sh`；
+- 每次原始 iperf JSON/stderr、可用的 socket 诊断和探针输出；
+- 参数计划、逐轮数据、配对结果、策略阈值和拒绝原因；
+- `report.json`：版本/commit、方向、原始/请求/最终配置、预算、选择/应用/恢复状态。CPU jiffies 和内存数据是诊断快照，未伪装成应用进程占用百分比。
+
+`flock` 保持整个会话和守护恢复的互斥；watchdog 检查父进程消失及截止时间。正常退出/中断通过统一清理路径恢复。独立恢复脚本冻结恢复代码，不依赖以后修改的 tcptune.sh。
 
 ```bash
+sudo bash /var/lib/tcptune/sessions/latest/restore.sh
+```
+
+持久化只更新本轮选中的 CC/缓冲项，保留原文件其他条目和注释，临时文件原子替换并逐项验证。不执行全局 `sysctl --system`，避免载入与测量无关的配置。恢复先恢复原配置文件，再还原实际运行值，不全局重载。
+
+`reboot_verified=false` 表示没有验证重启：其他 sysctl 文件、服务配置和应用的 socket 设置仍可能影响重启后的有效状态。旧会话不能覆盖更新的会话；恢复失败时检查报告和会话目录后先处理恢复，再开始新调优。
+
+## 测试与验证边界
+
+```bash
+bash -n tcptune.sh
 bash tests/regression.sh
+bash tests/integration.sh
+bash tests/linux-process.sh
+python3 -m unittest discover -s tests -p 'test_*.py'
+
+# 负对照应返回非零，并显示 FAIL=1。
+TCPTUNE_TEST_NEGATIVE_CONTROL=1 bash tests/regression.sh
 ```
 
-覆盖 13 个场景（18 个断言），包括：评分公式正确性、改善阈值、持久化文件内容、CLI 参数解析等。
-不需要 root 或网络连接。
+Bash 回归/流程测试均使用 fake sysctl/tc/iperf，不修改宿主参数、不访问公网；Linux 进程测试用真实 flock、真实进程和 SIGKILL 验证 watchdog，仍只写假内核状态。缺少 flock 的 Windows 明确 SKIP。Python 测试仅使用本机回环 HTTP。
 
----
+测试断言在子进程内计数并回传父进程，任意断言失败或场景异常会使整套测试非零退出。覆盖配对噪声、吞吐/延迟分支、独立验收、应用/读回/保存/报告失败、中断与独立恢复等。
 
-## 注意
+这些测试不证明公网收益、真实内核写入或运营商计费流量控制。需要真实 Linux VPS 和客户端验证；最终阈值与候选范围依实测收敛。
 
-- 需要 root 权限
-- 迷之调参（菜单 8）已废弃，不再是推荐的调优入口
-- qdisc 候选仅在能完整恢复的场景下生成（pfifo_fast/pfifo/fq/fq_codel/bfifo/cake/sfq）
-- 真实公网和代理体验改善需在实际 VPS 上验证；回环测试结果仅作内核参数对比参考
+参考：[Linux TCP sysctl 文档](https://docs.kernel.org/networking/ip-sysctl.html)、[iperf3 官方说明](https://software.es.net/iperf/invoking.html)。

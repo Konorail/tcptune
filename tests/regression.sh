@@ -1,224 +1,136 @@
 #!/usr/bin/env bash
-# tests/regression.sh — unit regression tests for tcptune scoring/selection logic
-# Run: bash tests/regression.sh
-# Requirements: bash, awk (no root, no network, no iperf3 needed)
+source "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
 
-# Note: no set -e — tests need to call functions that are expected to fail
-set -uo pipefail
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(dirname "$SCRIPT_DIR")"
+negative_control(){ assert_eq 'intentional failing assertion' expected incorrect; }
+if [ "${TCPTUNE_TEST_NEGATIVE_CONTROL:-0}" = 1 ]; then
+  run_case negative-control negative_control
+  finish_suite
+  exit $?
+fi
 
-PASS=0; FAIL=0; SKIP=0
-
-_pass(){ printf '  PASS: %s\n' "$1"; (( PASS++ )) || true; }
-_fail(){ printf '  FAIL: %s\n' "$1"; (( FAIL++ )) || true; }
-_skip(){ printf '  SKIP: %s\n' "$1"; (( SKIP++ )) || true; }
-
-##############################################################################
-# Extract helper functions from tcptune.sh without running the full script
-##############################################################################
-# Source only the pure-function parts we need (no root, no side effects).
-# We mock all syscall helpers to be no-ops.
-_load_helpers(){
-  # Minimal stubs so tcptune.sh sources cleanly without root or side effects
-  sysctl(){ :; }
-  sysctl_value(){ echo 0; }
-  ip(){ :; }
-  tc(){ :; }
-  iperf3(){ :; }
-  curl(){ :; }
-  has(){ return 1; }
-  require_root(){ return 0; }
-  lock_acquire(){ return 0; }
-  lock_release(){ :; }
-  session_create(){ SESSION_DIR="$(mktemp -d)"; return 0; }
-  session_restore_runtime(){ :; }
-  session_log(){ :; }
-  watchdog_start(){ :; }
-  watchdog_stop(){ :; }
-  clear_screen(){ :; }
-  green(){ printf '%s\n' "$*"; }
-  red(){ printf '%s\n' "$*" >&2; }
-  yellow(){ printf '%s\n' "$*"; }
-  pause(){ :; }
-  menu(){ :; }
-  apply_cc(){ :; }
-  apply_qdisc(){ :; }
-  apply_wmem(){ :; }
-  apply_rmem(){ :; }
-  proxy_acceptance_test(){ return 0; }
-  run_iperf3_json(){ :; }
-  persist_final_atomic(){ return 0; }
-
-  # Prevent auto-execution at source time
-  _parse_cli_args(){ :; }
-
-  # Source the script to pull in real implementations
-  # shellcheck source=../tcptune.sh
-  source "$REPO/tcptune.sh" 2>/dev/null || true
-}
-_load_helpers
-
-##############################################################################
-# Test helpers
-##############################################################################
-assert_eq(){ local name="$1" got="$2" want="$3"
-  if [ "$got" = "$want" ]; then _pass "$name"; else
-    _fail "$name: got='$got' want='$want'"; fi
-}
-assert_true(){ local name="$1" rc="$2"
-  if [ "$rc" -eq 0 ]; then _pass "$name"; else _fail "$name: expected 0 got $rc"; fi
-}
-assert_false(){ local name="$1" rc="$2"
-  if [ "$rc" -ne 0 ]; then _pass "$name"; else _fail "$name: expected non-0 got 0"; fi
+gates(){
+  assert_bad 'delay nearly doubles despite +10% throughput' score_candidate 110 0 199000 100 0 100000 10000000 11000000
+  assert_bad 'throughput falls below 95%' score_candidate 94 0 100000 100 0 100000 10000000 9400000
+  assert_bad 'zero baseline does not hide retransmit explosion' score_candidate 110 1000000 100000 100 0 100000 10000000 11000000
+  assert_bad 'known baseline RTT cannot become unknown' score_candidate 110 0 null 100 0 100000 10000000 11000000
+  assert_ok 'unknown RTT on both sides is not zero latency' score_candidate 110 0 null 100 0 null 10000000 11000000
+  assert_bad 'zero throughput is invalid' score_candidate 0 0 100000 0 0 100000 100 100
+  assert_ok 'low-loss slower option admissible for latency branch' score_candidate 97 0 70000 100 10 100000 10000000 10000000
+  local slow="$CANDIDATE_SCORE"
+  assert_ok 'faster option is admissible' score_candidate 120 10 100000 100 10 100000 10000000 10000000
+  assert_ok 'zero retransmissions get no ranking windfall' awk -v s="$slow" -v f="$CANDIDATE_SCORE" 'BEGIN{exit !(f>s)}'
 }
 
-##############################################################################
-# 1. score_candidate – throughput-only improvement (5%) should score > 1.0
-##############################################################################
-echo "=== 1. score_candidate: 5% throughput gain ==="
-BASELINE_THROUGHPUT=200; BASELINE_RETR=100; BASELINE_RTT=10000; BASELINE_BYTES=500000000
-score_candidate 210 100 10000 200 100 10000 500000000 510000000
-assert_true  "score_candidate returns 0"        $?
-awk "BEGIN{exit !($CANDIDATE_SCORE > 1.0)}" 2>/dev/null
-assert_true  "score > 1.0 for 5% tp gain"      $?
+proxy_gates(){
+  local b c
+  b='{"tp":100,"rtt":100000,"retr":0,"bytes":10000000,"proxy":{"status":"ok","p95_ms":100,"errors":0,"download_mbps":80}}'
+  c='{"tp":150,"rtt":100000,"retr":0,"bytes":15000000,"proxy":{"status":"ok","p95_ms":190,"errors":0,"download_mbps":100}}'
+  assert_bad 'application P95 vetoes throughput gain' _measurement_gates "$b" "$c"
+  c="$(jq -c '.proxy.p95_ms=100|.proxy.errors=1' <<< "$c")"
+  assert_bad 'application errors veto throughput gain' _measurement_gates "$b" "$c"
+  c="$(jq -c '.proxy.errors=0|.proxy.download_mbps=70' <<< "$c")"
+  assert_bad 'application throughput regression vetoes iperf gain' _measurement_gates "$b" "$c"
+  c="$(jq -c '.proxy={status:"not_configured"}' <<< "$c")"
+  assert_bad 'application metric coverage cannot disappear' _measurement_gates "$b" "$c"
+}
 
-##############################################################################
-# 2. score_candidate – 0.1% gain only: score should be ≤ 1.0 (not reliably better)
-##############################################################################
-echo "=== 2. score_candidate: 0.1% gain only ==="
-score_candidate 200.2 100 10000 200 100 10000 500000000 500500000
-# 0.1% gain in tp_ratio: 0.001*0.7 = 0.0007 improvement in score; still > 1.0 numerically
-# but is_reliable_improvement must reject it
-RETEST_CAND_TP_MEDIAN=200.2; RETEST_BASE_TP_MEDIAN=200
-RETEST_CAND_RTT_MEDIAN=10000; RETEST_BASE_RTT_MEDIAN=10000
-is_reliable_improvement 200.2 200 10000 10000
-assert_false "is_reliable_improvement rejects 0.1% gain" $?
+paired_stats(){
+  SESSION_DIR="$CASE_TMP"; RETEST_STAGE=retest; RETEST_GATE_FAILED=0
+  local b c i file="$CASE_TMP/pairs"
+  : > "$file"
+  for i in 80 100 120 90 110; do
+    b="$(jq -cn --argjson t "$i" '{tp:$t,rtt:100000,proxy:{status:"not_configured"}}')"
+    c="$(jq -cn --argjson t "$i" '{tp:($t*1.1),rtt:100000,proxy:{status:"not_configured"}}')"
+    jq -cn --argjson b "$b" --argjson c "$c" '{stage:"retest",valid:true,baseline:$b,candidate:$c}' >> "$file"
+  done
+  RETEST_STATS="$(_pair_statistics "$file")"
+  printf '%s\n' "$RETEST_STATS" > "$CASE_TMP/statistics.json"
+  assert_json 'median paired gain is 10%' "$CASE_TMP/statistics.json" '.gain_pct>9.99 and .gain_pct<10.01'
+  assert_bad 'baseline dispersion raises the improvement threshold' is_reliable_improvement
+  # Same clear gain with a stable baseline qualifies.
+  jq -c '.baseline.tp=100|.candidate.tp=110' "$file" > "$file.stable"
+  RETEST_STATS="$(_pair_statistics "$file.stable")"
+  assert_ok 'consistent stable +10% gain qualifies' is_reliable_improvement
+  RETEST_STATS="$(jq -c '.tp_direction_fraction=0.6' <<< "$RETEST_STATS")"
+  assert_bad '60% directional consistency is insufficient' is_reliable_improvement
+  RETEST_STATS="$(jq -c '.pairs=2|.tp_direction_fraction=1' <<< "$RETEST_STATS")"
+  assert_bad 'two pairs never authorize commit' is_reliable_improvement
+  RETEST_STATS='{"pairs":5,"latency_pairs":5,"latency_gain_pct":28,"latency_threshold":20,"latency_direction_fraction":1,"gain_pct":-3,"tp_threshold":5,"tp_direction_fraction":0}'
+  assert_ok 'latency branch can accept 97% throughput after gates' is_reliable_improvement
+  jq -c '.baseline.tp=100|.candidate.tp=100|.baseline.proxy={status:"ok",download_mbps:50,p95_ms:100}|.candidate.proxy={status:"ok",download_mbps:55,p95_ms:100}' "$file.stable" > "$file.proxy"
+  RETEST_STATS="$(_pair_statistics "$file.proxy")"
+  assert_ok 'proxy throughput is primary when actual client probe configured' is_reliable_improvement
+  assert_eq 'metric named truthfully' proxy_download_mbps "$(jq -r .throughput_metric <<< "$RETEST_STATS")"
+  RETEST_GATE_FAILED=1
+  assert_bad 'failed hard gate cannot be offset by a median benefit' is_reliable_improvement
+}
 
-##############################################################################
-# 3. score_candidate – P95 RTT improves 20%, tp >= 95%: should be reliable
-##############################################################################
-echo "=== 3. is_reliable_improvement: RTT improves 20%, tp steady ==="
-is_reliable_improvement 195 200 8000 10000
-assert_true  "RTT 20% improvement with tp>=95% qualifies" $?
+validation(){
+  AT_TARGET=192.0.2.1
+  assert_ok 'defaults valid' _validate_auto_options
+  AT_RETEST_ROUNDS=2; assert_bad 'fewer than three rounds invalid' _validate_auto_options
+  AT_RETEST_ROUNDS=5; AT_DURATION=08; assert_bad 'ambiguous octal-like integer rejected' _validate_auto_options
+  AT_DURATION=10; AT_MAX_RTT_FACTOR=200; assert_bad 'permissive 200% RTT policy rejected' _validate_auto_options
+  AT_MAX_RTT_FACTOR=115; AT_BUDGET_GIB=NaN; assert_bad 'nonfinite budget rejected' _validate_auto_options
+}
 
-##############################################################################
-# 4. score_candidate – RTT doubles: score_candidate must reject
-##############################################################################
-echo "=== 4. score_candidate: RTT doubles → rejected ==="
-# base_rtt=10000, cand_rtt=25000 (>200%)
-score_candidate 220 50 25000 200 100 10000 500000000 520000000
-assert_false "RTT >200% base causes score_candidate failure" $?
+normalization(){
+  assert_eq 'tabs and spaces normalize identically' '4096 16384 8388608' "$(normalize_value $'4096\t16384 8388608')"
+  setup_mock
+  assert_ok 'buffer preserves original min and default' apply_wmem 8388608
+  assert_eq 'only max changes' '4096 16384 8388608' "$(normalize_value "$(sysctl_value net.ipv4.tcp_wmem)")"
+  assert_bad 'buffer smaller than default rejected' apply_wmem 1000
+  assert_bad 'queue changes deliberately rejected' apply_qdisc fq
+  assert_ok 'queue preservation succeeds' apply_qdisc fq_codel
+}
 
-##############################################################################
-# 5. score_candidate – zero retransmissions don't produce huge bonus
-##############################################################################
-echo "=== 5. score_candidate: zero-retr candidate vs 5% faster ==="
-# Candidate A: 190 Mbps, 0 retransmits — should NOT beat B (300 Mbps, 100 retr)
-score_candidate 190 0 10000 200 100 10000 500000000 500000000
-score_A="$CANDIDATE_SCORE"
-score_candidate 300 100 10000 200 100 10000 500000000 500000000
-score_B="$CANDIDATE_SCORE"
-awk "BEGIN{exit !($score_B > $score_A)}" 2>/dev/null
-assert_true  "300Mbps candidate beats 190Mbps zero-retr candidate" $?
+runner_negative(){
+  local rc=0
+  TCPTUNE_TEST_NEGATIVE_CONTROL=1 bash "$TEST_DIR/regression.sh" > "$CASE_TMP/negative.log" 2>&1 || rc=$?
+  assert_eq 'intentional assertion failure exits suite nonzero' 1 "$rc"
+  assert_ok 'negative suite counts failed child assertion' grep -q 'FAIL=1' "$CASE_TMP/negative.log"
+}
 
-##############################################################################
-# 6. is_reliable_improvement – one node improves, RTT worsens slightly
-##############################################################################
-echo "=== 6. is_reliable_improvement: tp +7%, RTT same ==="
-is_reliable_improvement 214 200 10000 10000
-assert_true  "7% tp gain qualifies as reliable" $?
+cli_order(){
+  auto_tune_flow(){ printf '%s %s %s\n' "$AT_TARGET" "$AT_DURATION" "$AT_NO_PERSIST"; return 2; }
+  local rc=0
+  (_parse_cli_args --auto-tune --no-persist --duration 7 --target 192.0.2.1) > "$CASE_TMP/cli" || rc=$?
+  assert_eq 'CLI forwards actual flow status' 2 "$rc"
+  assert_eq 'options after --auto-tune are parsed first' '192.0.2.1 7 1' "$(cat "$CASE_TMP/cli")"
+  assert_bad 'missing argument fails' bash "$REPO/tcptune.sh" --duration
+  assert_bad 'unknown option fails' bash "$REPO/tcptune.sh" --bogus-option
+}
 
-##############################################################################
-# 7. is_reliable_improvement – tp improves 4.9% (below 5% threshold) → reject
-##############################################################################
-echo "=== 7. is_reliable_improvement: tp +4.9% below threshold ==="
-is_reliable_improvement 209.8 200 10000 10000
-assert_false "4.9% tp gain is below AT_MIN_TP_GAIN threshold" $?
+proxy_probe(){
+  PROXY_HOST=127.0.0.1; PROXY_TEST_URL=http://origin/bulk; PROXY_SMALL_URL=http://origin/small
+  PROXY_REQUESTS=20; PROXY_MAX_BYTES=1000000; PROXY_SMALL_MAX_BYTES=4096
+  curl(){
+    local is_bulk=0 arg count=0 i
+    for arg in "$@"; do [ "$arg" != --range ] || is_bulk=1; done
+    if [ "$is_bulk" -eq 1 ]; then
+      for ((i=0;i<100;i++)); do
+        if [ -f "$CASE_TMP/probe-count" ]; then read -r count < "$CASE_TMP/probe-count"; fi
+        [ "$count" -lt 20 ] || break
+        sleep 0.05
+      done
+      printf '206 100000 1.0\n'
+    else
+      if [ -f "$CASE_TMP/probe-count" ]; then read -r count < "$CASE_TMP/probe-count"; fi
+      printf '%s\n' "$((count+1))" > "$CASE_TMP/probe-count"
+      printf '200 1024 0.020\n'
+    fi
+  }
+  assert_ok 'proxy probe actually aggregates concurrent loaded requests' _probe_to_file
+  assert_json 'proxy quantiles and byte accounting' "$CASE_TMP/probe.json" '.requests==20 and .errors==0 and .p50_ms==20 and .p95_ms==20 and .bytes==120480'
+}
+_probe_to_file(){ _proxy_probe_impl > "$CASE_TMP/probe.json"; }
 
-##############################################################################
-# 8. _median correctness
-##############################################################################
-echo "=== 8. _median ==="
-m="$(_median 10 20 30)"
-assert_eq "_median of 10 20 30" "$m" "20"
-m="$(_median 10 30)"
-assert_eq "_median of 10 30" "$m" "20.0000"
-
-##############################################################################
-# 9-11. persist_final_atomic: file content tests (stub sysctl read-back)
-##############################################################################
-# The real persist_final_atomic calls sysctl to read back applied values.
-# In this non-root test environment sysctl reads would return wrong values.
-# We stub sysctl_value to return the configured value so read-back passes.
-
-# sysctl_value stub: return the value from the temp conf file we just wrote.
-sysctl_value(){ grep -E "^[^#].*${1##net.ipv4.}" "$CONF" 2>/dev/null | awk -F'=' '{print $2}' | xargs || echo ""; }
-
-echo "=== 9. persist_final_atomic: CC-only candidate ==="
-CONF="$(mktemp)"; SESSION_DIR="$(mktemp -d)"
-# Stub sysctl_value to return the configured value
-sysctl_value(){ case "$1" in
-  net.ipv4.tcp_congestion_control) echo "bbr" ;;
-  net.core.default_qdisc) echo "fq" ;;
-  *) echo "" ;; esac; }
-persist_final_atomic "bbr" "fq" "" ""
-assert_true "persist_final_atomic CC-only returns 0" $?
-grep -q "tcp_congestion_control" "$CONF"
-assert_true "CC written to conf file" $?
-rm -f "$CONF"; rm -rf "$SESSION_DIR"
-
-echo "=== 10. persist_final_atomic: wmem-only candidate ==="
-CONF="$(mktemp)"; SESSION_DIR="$(mktemp -d)"
-sysctl_value(){ case "$1" in
-  net.ipv4.tcp_congestion_control) echo "cubic" ;;
-  net.core.default_qdisc) echo "fq_codel" ;;
-  net.ipv4.tcp_wmem) echo "4096 16384 4194304" ;;
-  *) echo "" ;; esac; }
-persist_final_atomic "cubic" "fq_codel" "4194304" ""
-assert_true "persist_final_atomic wmem-only returns 0" $?
-grep -q "tcp_wmem" "$CONF"
-assert_true "wmem_max written to conf file" $?
-rm -f "$CONF"; rm -rf "$SESSION_DIR"
-
-echo "=== 11. persist_final_atomic: rmem-only candidate ==="
-CONF="$(mktemp)"; SESSION_DIR="$(mktemp -d)"
-sysctl_value(){ case "$1" in
-  net.ipv4.tcp_congestion_control) echo "cubic" ;;
-  net.core.default_qdisc) echo "fq_codel" ;;
-  net.ipv4.tcp_rmem) echo "4096 87380 8388608" ;;
-  *) echo "" ;; esac; }
-persist_final_atomic "cubic" "fq_codel" "" "8388608"
-assert_true "persist_final_atomic rmem-only returns 0" $?
-grep -q "tcp_rmem" "$CONF"
-assert_true "rmem_max written to conf file" $?
-rm -f "$CONF"; rm -rf "$SESSION_DIR"
-
-# Restore sysctl_value stub
-sysctl_value(){ echo 0; }
-
-##############################################################################
-# 12. CLI args: --auto-tune without --target must exit with error
-##############################################################################
-echo "=== 12. --auto-tune without --target exits with error ==="
-output="$(bash "$REPO/tcptune.sh" --auto-tune 2>&1 || true)"
-# Accept either: RESULT=failed, root message, or the --target error
-echo "$output" | grep -qE "RESULT=failed|--target|AT_TARGET|root|自动模式"
-assert_true "--auto-tune without --target reports error or root requirement" $?
-
-##############################################################################
-# 13. CLI args: argument order independence
-##############################################################################
-echo "=== 13. CLI arg order independence ==="
-# --duration after --auto-tune should still parse correctly
-output2="$(bash "$REPO/tcptune.sh" --duration 5 --auto-tune --target 127.0.0.1 2>&1 || true)"
-# Should not complain about unknown args; will fail on network/root but not on arg parsing
-echo "$output2" | grep -qvE "unrecognized|illegal option"
-assert_true "CLI args in any order do not produce parse errors" $?
-
-##############################################################################
-# Summary
-##############################################################################
-echo
-printf '=== 结果: PASS=%d  FAIL=%d  SKIP=%d ===\n' "$PASS" "$FAIL" "$SKIP"
-[ "$FAIL" -eq 0 ]
+run_case constraints gates
+run_case proxy-constraints proxy_gates
+run_case paired-evidence paired_stats
+run_case option-validation validation
+run_case buffer-and-whitespace normalization
+run_case runner-negative-control runner_negative
+run_case cli-order-and-errors cli_order
+run_case proxy-probe-aggregation proxy_probe
+finish_suite

@@ -1,519 +1,267 @@
 #!/usr/bin/env bash
-# integration.sh — mock-based integration tests for the full auto_tune_flow.
-# Tests are isolated: no real network, no real sysctl writes, no root required.
-# All external calls are stubbed. Run with: bash tests/integration.sh
+source "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
 
-set -u
-PASS=0; FAIL=0; SKIP=0
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TCPTUNE="${SCRIPT_DIR}/../tcptune.sh"
-
-#############################################################################
-# Test helpers
-#############################################################################
-assert_eq(){ local d="$1" e="$2" a="$3"
-  if [ "$e" = "$a" ]; then printf '  PASS: %s\n' "$d"; (( PASS++ )); return 0
-  else printf '  FAIL: %s: expected "%s" got "%s"\n' "$d" "$e" "$a"; (( FAIL++ )); return 1; fi
-}
-assert_zero(){ local d="$1" v="$2"
-  if [ "$v" -eq 0 ] 2>/dev/null; then printf '  PASS: %s\n' "$d"; (( PASS++ )); return 0
-  else printf '  FAIL: %s: expected 0 got "%s"\n' "$d" "$v"; (( FAIL++ )); return 1; fi
-}
-assert_nonzero(){ local d="$1" v="$2"
-  if [ "${v:-0}" -ne 0 ] 2>/dev/null; then printf '  PASS: %s\n' "$d"; (( PASS++ )); return 0
-  else printf '  FAIL: %s: expected non-zero got "%s"\n' "$d" "$v"; (( FAIL++ )); return 1; fi
+committed(){
+  setup_mock; run_mock_auto
+  assert_eq 'commit exit code' 0 "$AUTO_RC"
+  assert_json 'commit records measured/selected/persisted state' "$REPORT" '.result=="committed" and .selected and .applied and .persisted and (.reboot_verified|not)'
+  assert_json 'fresh acceptance data exists' "$REPORT" '([.pairs[]|select(.stage=="acceptance")]|length)==3 and ([.pairs[]|select(.stage=="retest")]|length)==3'
+  assert_json 'pair order is balanced' "$REPORT" '[.pairs[]|select(.stage=="retest")|.order]==["baseline candidate","candidate baseline","baseline candidate"]'
+  assert_ok 'unrelated persistent setting survives' grep -q 'net.core.somaxconn = 1234' "$CONF"
+  assert_ok 'CC persisted' grep -q 'net.ipv4.tcp_congestion_control = bbr' "$CONF"
+  assert_eq 'runtime matches winner' bbr "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  assert_ok 'standalone restore script remains' test -x "$(dirname "$REPORT")/restore.sh"
+  assert_bad 'no tc replacement occurred' test -f "$CASE_TMP/tc-mutation"
 }
 
-#############################################################################
-# Set up stub environment shared by all tests.
-# Load tcptune.sh WITHOUT executing main (BASH_SOURCE guard must be active).
-#############################################################################
-_load_tcptune(){
-  # Source first (guard keeps menu from running); stubs are defined after
-  # shellcheck source=../tcptune.sh
-  source "$TCPTUNE" 2>/dev/null
+temporary(){
+  setup_mock; AT_NO_PERSIST=1; run_mock_auto
+  assert_eq 'temporary success has distinct exit code' 3 "$AUTO_RC"
+  assert_json 'temporary outcome accurately reports restoration' "$REPORT" '.result=="validated" and .selected and (.applied|not) and (.persisted|not) and .restore_verified'
+  assert_ok 'persistent file byte-for-byte unchanged' cmp -s "$CONF" "$CASE_TMP/original.conf"
+  assert_eq 'runtime restored to baseline' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+}
 
-  # Override after sourcing so tcptune.sh definitions don't win
-  sysctl(){ :; }
-  sysctl_value(){
-    case "$1" in
-      net.ipv4.tcp_congestion_control) echo "cubic" ;;
-      net.ipv4.tcp_available_congestion_control) echo "cubic bbr reno" ;;
-      net.core.default_qdisc) echo "fq_codel" ;;
-      net.ipv4.tcp_wmem) echo "4096 16384 4194304" ;;
-      net.ipv4.tcp_rmem) echo "4096 87380 6291456" ;;
-      *) echo "0" ;;
-    esac
+unchanged(){
+  setup_mock; MOCK_SCENARIO=no_gain; run_mock_auto
+  assert_eq 'tiny gain returns no_change' 2 "$AUTO_RC"
+  assert_json 'no_change verified restored' "$REPORT" '.result=="no_change" and .restore_verified and (.applied|not)'
+  assert_ok 'old file survives no_change' cmp -s "$CONF" "$CASE_TMP/original.conf"
+}
+
+latency(){
+  setup_mock; MOCK_SCENARIO=latency; run_mock_auto
+  assert_eq 'latency-led winner can commit' 0 "$AUTO_RC"
+  assert_json 'paired latency gain is measured' "$REPORT" '.acceptance.latency_gain_pct>20 and .acceptance.gain_pct<0'
+}
+
+bad_latency(){
+  setup_mock; MOCK_SCENARIO=latency_regression; run_mock_auto
+  assert_eq 'bad latency returns no_change' 2 "$AUTO_RC"
+  assert_json 'no selection' "$REPORT" '(.selected|not) and .restore_verified'
+}
+
+late_retrans(){
+  setup_mock; MOCK_SCENARIO=late_retrans; run_mock_auto
+  assert_eq 'retest retransmission explosion rejected' 2 "$AUTO_RC"
+  assert_json 'bad pair veto recorded' "$REPORT" '[.pairs[].reason]|index("retransmit_regression")!=null'
+  assert_eq 'CC restored' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+}
+
+holdout(){
+  setup_mock; MOCK_SCENARIO=holdout_failure; run_mock_auto
+  assert_eq 'new data can overturn screening/retest winner' 2 "$AUTO_RC"
+  assert_json 'holdout rejection is explicit' "$REPORT" '.reason|startswith("acceptance_")'
+  assert_ok 'holdout failure does not persist' cmp -s "$CONF" "$CASE_TMP/original.conf"
+}
+
+application_failures(){
+  setup_mock; MOCK_SCENARIO=apply_failure; run_mock_auto
+  assert_eq 'unapplied candidate never wins' 2 "$AUTO_RC"
+  assert_eq 'only baseline measured' 1 "$(wc -l < "$CASE_TMP/network.log" | tr -d ' ')"
+  assert_json 'restored after apply failure' "$REPORT" '.restore_verified'
+}
+
+readback(){
+  setup_mock; MOCK_SCENARIO=readback_mismatch; run_mock_auto
+  assert_eq 'readback mismatch cannot win' 2 "$AUTO_RC"
+  assert_eq 'no measurement of unapplied candidate' 1 "$(wc -l < "$CASE_TMP/network.log" | tr -d ' ')"
+}
+
+retest_apply(){
+  setup_mock; MOCK_SCENARIO=retest_apply_failure; run_mock_auto
+  assert_eq 'application failure during retest rejects candidate' 2 "$AUTO_RC"
+  assert_json 'failed retest recorded' "$REPORT" '[.pairs[]|select(.valid==false)]|length>0'
+}
+
+final_apply(){
+  setup_mock; MOCK_SCENARIO=final_apply_failure; run_mock_auto
+  assert_eq 'final application failure is failed outcome' 1 "$AUTO_RC"
+  assert_json 'final failure restores baseline' "$REPORT" '.result=="failed" and .restore_verified and (.persisted|not)'
+}
+
+baseline_failure(){
+  setup_mock; MOCK_SCENARIO=baseline_failure; run_mock_auto
+  assert_eq 'baseline failure is not no_change' 1 "$AUTO_RC"
+  assert_json 'baseline failure reports reason' "$REPORT" '.reason=="iperf_measurement_failed" and .restore_verified'
+}
+
+missing_pairs(){
+  setup_mock; MOCK_SCENARIO=missing_pairs; run_mock_auto
+  assert_eq 'missing pairs cannot authorize commit' 2 "$AUTO_RC"
+  assert_json 'missing pair remains visible' "$REPORT" '[.pairs[]|select(.valid==false)]|length>0'
+}
+
+persist_failure(){
+  setup_mock
+  persist_final_atomic(){ RUN_PERSIST_TOUCHED=1; printf 'broken config' > "$CONF"; return 1; }
+  run_mock_auto
+  assert_eq 'persist failure is failed outcome' 1 "$AUTO_RC"
+  assert_ok 'persistent bytes restored' cmp -s "$CONF" "$CASE_TMP/original.conf"
+  assert_eq 'runtime restored on persist failure' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+}
+
+restore_failure(){
+  setup_mock; MOCK_SCENARIO=restore_failure; run_mock_auto
+  assert_eq 'restore failure is failed, never no_change' 1 "$AUTO_RC"
+  assert_json 'restore failure honestly reported' "$REPORT" '.reason=="restore_failed" and (.restore_verified|not)'
+  assert_bad 'failed restore does not mark session complete' test -f "$(dirname "$REPORT")/complete"
+  assert_bad 'new run refuses unverified original state' lock_acquire
+}
+
+receiver(){
+  setup_mock; AT_DIRECTION=upload; MOCK_SCENARIO=receiver_cc; run_mock_auto
+  assert_eq 'receiver mode does not tune local sender CC' 2 "$AUTO_RC"
+  assert_eq 'receiver mode only measures baseline without evidence' 1 "$(wc -l < "$CASE_TMP/network.log" | tr -d ' ')"
+  assert_ok 'persistent config untouched' cmp -s "$CONF" "$CASE_TMP/original.conf"
+}
+
+budget_preflight(){
+  setup_mock
+  check_actual_qdisc; lock_acquire; session_create
+  RUN_START="$(date +%s)"; BUDGET_LIMIT_BYTES=1; BUDGET_USED_BYTES=0
+  iperf3(){ printf 'unexpected call\n' > "$CASE_TMP/unexpected"; return 1; }
+  assert_bad 'budget checked before network invocation' run_iperf3_json "$AT_TARGET" download 2 1
+  assert_eq 'budget reason' traffic_budget_exhausted "$MEASURE_REASON"
+  assert_bad 'no network on exhausted budget' test -f "$CASE_TMP/unexpected"
+  RUN_START=$(( $(date +%s)-1000 )); BUDGET_LIMIT_BYTES=999999999
+  assert_bad 'time budget checked before network invocation' run_iperf3_json "$AT_TARGET" download 2 1
+  assert_eq 'time reason' time_budget_exhausted "$MEASURE_REASON"
+  touch "$SESSION_DIR/complete"; lock_release
+}
+
+json_parser(){
+  setup_mock
+  check_actual_qdisc; lock_acquire; session_create
+  RUN_START="$(date +%s)"; BUDGET_LIMIT_BYTES=999999999; BUDGET_USED_BYTES=0
+  iperf3(){
+    printf '%s\n' "$*" > "$CASE_TMP/iperf-args"
+    printf '{"end":{"sum_received":{"bits_per_second":100000000,"bytes":25000000}},"server_output_json":{"end":{"sum_sent":{"retransmits":7},"streams":[{"sender":{"mean_rtt":123456}}]}}}\n'
   }
-  require_root(){ return 0; }
-  lock_acquire(){ LOCK_HELD=1; return 0; }
-  lock_release(){ LOCK_HELD=0; return 0; }
-  watchdog_start(){ WATCHDOG_PID=0; return 0; }
-  watchdog_stop(){ WATCHDOG_PID=""; return 0; }
-  clear_screen(){ :; }
-  pause(){ :; }
-  # stub has() so the dependency check does not fail in a test environment without iperf3
-  has(){ return 0; }
-  check_actual_qdisc(){ ACTUAL_IFACE="eth0"; ACTUAL_QDISC="fq_codel"; }
-  run_diagnostic_buffer_test(){ BUFFER_LIMITED=0; return 0; }
-  ping(){ echo "rtt min/avg/max/mdev = 10.0/15.0/20.0/1.0 ms"; }
-  session_log(){ :; }
-  # apply stubs: succeed by default; tests override _APPLY_CC_FAIL=1 to force failure
-  apply_cc(){    [ "${_APPLY_CC_FAIL:-0}"    -eq 1 ] && return 1; return 0; }
-  apply_qdisc(){ [ "${_APPLY_QDISC_FAIL:-0}" -eq 1 ] && return 1; return 0; }
-  apply_wmem(){  return 0; }
-  apply_rmem(){  return 0; }
-  # persist stub: succeed by default; tests set _PERSIST_FAIL=1 to force failure
-  persist_final_atomic(){ [ "${_PERSIST_FAIL:-0}" -eq 1 ] && return 1; return 0; }
-  # restore stub: always succeed
-  session_restore_runtime(){ return 0; }
-  # session_create stub: create a real temp dir but with controlled content
-  session_create(){
-    _setup_session
-    return 0
+  install_mock_iperf
+  assert_ok 'receiver parses remote sender RTT/retransmissions' run_iperf3_json "$AT_TARGET" upload 2 1
+  assert_eq 'remote retransmit counter' 7 "$IPERF_RETR"
+  assert_eq 'remote mean RTT' 123456 "$IPERF_RTT"
+  assert_ok 'reverse direction requested' grep -q -- '-R' "$CASE_TMP/iperf-args"
+  assert_eq 'actual bytes replace reserved estimate' 25000000 "$BUDGET_USED_BYTES"
+  assert_json 'raw data linked from measurement' "$SESSION_DIR/measurements.jsonl" '.sender=="peer" and .metrics.rtt==123456'
+  iperf3(){ printf '{"end":{"sum_received":{"bits_per_second":100000000,"bytes":25000000}}}\n'; }
+  install_mock_iperf
+  assert_ok 'unknown sender fields allowed as unknown' run_iperf3_json "$AT_TARGET" download 2 1
+  assert_eq 'missing RTT is null' null "$IPERF_RTT"
+  assert_eq 'missing retransmit counter is null' null "$IPERF_RETR"
+  touch "$SESSION_DIR/complete"; lock_release
+}
+
+buffer_apply_failure(){
+  setup_mock; check_actual_qdisc; lock_acquire; session_create
+  apply_wmem(){ return 1; }
+  assert_bad 'buffer write failure propagates' apply_candidate_verified bbr fq_codel 8388608 ''
+  assert_ok 'baseline can be restored' session_restore_runtime
+  touch "$SESSION_DIR/complete"; lock_release
+}
+
+unsupported_remote(){
+  assert_bad 'legacy multi-node auto commit explicitly unavailable' remote_auto_tune_flow
+}
+
+standalone_restore(){
+  setup_mock; rm -f "$CONF"
+  run_mock_auto
+  assert_eq 'originally absent config can be committed' 0 "$AUTO_RC"
+  install_mock_commands
+  assert_ok 'generated restore script is valid Bash' bash -n "$(dirname "$REPORT")/restore.sh"
+  assert_ok 'standalone restore executes its real implementation' bash "$(dirname "$REPORT")/restore.sh"
+  assert_eq 'standalone restores multi-word values' '4096 16384 4194304' "$(normalize_value "$(sysctl_value net.ipv4.tcp_wmem)")"
+  assert_eq 'standalone restores original CC' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  assert_bad 'originally absent persistent file removed' test -f "$CONF"
+  assert_bad 'complex qdisc never replaced during restore' test -f "$CASE_TMP/tc-mutation"
+}
+
+multiple_candidates(){
+  setup_mock
+  printf 'reno\n' > "$MOCK_SYS_DIR/net.ipv4.tcp_congestion_control"
+  printf 'reno cubic bbr\n' > "$MOCK_SYS_DIR/net.ipv4.tcp_available_congestion_control"
+  # Override metrics after the normal fixture, using actual applied CC.
+  run_iperf3_json(){
+    mock_measurement "$@" || return $?
+    if [ "$MEASURE_ROLE" = candidate ]; then
+      if [ "$(sysctl_value net.ipv4.tcp_congestion_control)" = bbr ]; then IPERF_THROUGHPUT=101
+      else IPERF_THROUGHPUT=107; fi
+    fi
   }
+  AUTO_RC=0; auto_tune_flow > "$CASE_TMP/output" 2> "$CASE_TMP/stderr" || AUTO_RC=$?
+  REPORT="$(find "$SESSIONS_BASE" -name report.json -type f | head -n1)"
+  assert_eq 'multiple candidate selection succeeds' 0 "$AUTO_RC"
+  assert_json '107% candidate beats 101% candidate' "$REPORT" '.requested.cc=="cubic"'
 }
 
-#############################################################################
-# create a temp session dir and wire globals for a test run
-#############################################################################
-_setup_session(){
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  SESSION_DIR="$tmpdir"
-  mkdir -p "$SESSION_DIR"
-  # snapshot.conf used in before/after compare display
-  printf 'net.ipv4.tcp_congestion_control = cubic\nnet.core.default_qdisc = fq_codel\n' \
-    > "$SESSION_DIR/snapshot.conf"
-  # orig_persistent.conf
-  printf '' > "$SESSION_DIR/orig_persistent.conf"
-  printf 'absent' > "$SESSION_DIR/orig_persistent.status"
-  # pre-create restore.sh so watchdog / restore calls don't fail
-  printf '#!/bin/bash\necho restore\n' > "$SESSION_DIR/restore.sh"
-  BUDGET_USED_BYTES=0
-  AT_BUDGET_GIB=20
-}
-_cleanup_session(){ rm -rf "${SESSION_DIR:-/tmp/_never}"; SESSION_DIR=""; }
-
-#############################################################################
-# Helpers to simulate iperf3 results
-# Usage: _mock_iperf3 <call_number> [tp_mbps retr rtt_us bytes]
-# Caller sets _MOCK_TP / _MOCK_RETR / _MOCK_RTT / _MOCK_BYTES arrays;
-# run_iperf3_json is redefined to pop from the front of those arrays.
-#############################################################################
-_MOCK_CALLS=0
-_MOCK_TP=()
-_MOCK_RETR=()
-_MOCK_RTT=()
-_MOCK_BYTES=()
-_MOCK_FAIL=()  # indices (0-based) at which to fail
-
-_mock_run_iperf3_json(){
-  local idx="$_MOCK_CALLS"
-  _MOCK_CALLS=$(( _MOCK_CALLS + 1 ))
-  # Check if this call index should fail
-  local _f
-  for _f in "${_MOCK_FAIL[@]:-}"; do
-    [ "$_f" = "$idx" ] && return 1
-  done
-  IPERF_THROUGHPUT="${_MOCK_TP[$idx]:-100}"
-  IPERF_RETR="${_MOCK_RETR[$idx]:-0}"
-  IPERF_RTT="${_MOCK_RTT[$idx]:-50000}"
-  IPERF_BYTES="${_MOCK_BYTES[$idx]:-250000000}"
-  _at_budget_add "${IPERF_BYTES:-0}"
-  return 0
+noisy(){
+  setup_mock; MOCK_SCENARIO=noisy; run_mock_auto
+  assert_eq 'stable paired gain below measured noise stays unchanged' 2 "$AUTO_RC"
+  assert_json 'noise raises the acceptance threshold' "$REPORT" '.acceptance.tp_threshold>5'
 }
 
-#############################################################################
-# stub apply functions (default: success; override with apply_cc_FAIL=1 etc)
-#############################################################################
-_APPLY_CC_FAIL=0
-_APPLY_QDISC_FAIL=0
-apply_cc(){    [ "$_APPLY_CC_FAIL"    -eq 1 ] && return 1; return 0; }
-apply_qdisc(){ [ "$_APPLY_QDISC_FAIL" -eq 1 ] && return 1; return 0; }
-apply_wmem(){  return 0; }
-apply_rmem(){  return 0; }
-
-#############################################################################
-# stub persist / session restore
-#############################################################################
-_PERSIST_FAIL=0
-persist_final_atomic(){ [ "$_PERSIST_FAIL" -eq 1 ] && return 1; return 0; }
-session_restore_runtime(){ return 0; }
-session_create(){
-  _setup_session
-  return 0
-}
-_at_cleanup(){ return 0; }
-
-#############################################################################
-# Override sysctl_value to generate exactly 1 candidate (CC=bbr only).
-# Call this after _load_tcptune in tests that need predictable mock data:
-#   call 0 = baseline, call 1 = bbr screening, calls 2-7 = retest (3 pairs).
-#############################################################################
-_single_cand_env(){
-  sysctl_value(){
-    case "$1" in
-      net.ipv4.tcp_congestion_control) echo "cubic" ;;
-      net.ipv4.tcp_available_congestion_control) echo "cubic bbr" ;;
-      net.core.default_qdisc) echo "fq" ;;  # already fq → no fq candidate generated
-      net.ipv4.tcp_wmem) echo "4096 16384 4194304" ;;
-      net.ipv4.tcp_rmem) echo "4096 87380 6291456" ;;
-      *) echo "0" ;;
-    esac
-  }
+interrupted(){
+  setup_mock; MOCK_SCENARIO=interrupted; run_mock_auto
+  assert_eq 'TERM interrupts the entire tuning flow' 1 "$AUTO_RC"
+  assert_json 'interrupt restoration verified' "$REPORT" '.reason=="interrupted" and .restore_verified and (.applied|not)'
+  assert_ok 'persistent bytes unchanged by interrupt' cmp -s "$CONF" "$CASE_TMP/original.conf"
 }
 
-#############################################################################
-# Run auto_tune_flow in --auto-tune mode and capture output + exit code.
-# Uses a temp file to avoid a nested subshell (arrays are not copied into $()).
-#############################################################################
-_run_auto(){
-  AT_AUTO=1
-  AT_TARGET="192.0.2.1"
-  AT_DIRECTION="download"
-  AT_DURATION=1
-  AT_MAX_CANDIDATES=4
-  AT_RETEST_ROUNDS=3
-  AT_MAX_SHORTLIST=3
-  AT_MIN_TP_GAIN=5
-  AT_MIN_RTT_GAIN=20
-  AT_MAX_RTT_FACTOR=200
-  AT_EXIT_COMMITTED=0
-  AT_EXIT_FAILED=1
-  AT_EXIT_NO_CHANGE=2
-  run_iperf3_json(){ _mock_run_iperf3_json "$@"; }
-  _MOCK_CALLS=0
-  RESULT_LINE=""
-  local _out_file _rc
-  _out_file="$(mktemp)"
-  auto_tune_flow > "$_out_file" 2>/dev/null
-  _rc=$?
-  RESULT_LINE="$(grep '^RESULT=' "$_out_file" | tail -1)"
-  rm -f "$_out_file"
-  return $_rc
+report_failure(){
+  setup_mock
+  _write_report(){ return 1; }
+  run_mock_auto
+  assert_eq 'report write failure rejects commit' 1 "$AUTO_RC"
+  assert_eq 'report write failure restores runtime' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  assert_ok 'report write failure restores persistent config' cmp -s "$CONF" "$CASE_TMP/original.conf"
 }
 
-##############################################################################
-# TEST 1: committed — candidate +10% throughput, passes screening + retest
-# 1 candidate (bbr): call 0=baseline, call 1=screening, calls 2-7=retest pairs
-##############################################################################
-echo "=== 1. committed path: +10% throughput ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  #  idx 0: baseline=100 Mbps
-  #  idx 1: bbr screening=110 Mbps (+10%, score>1, qualifies)
-  #  idx 2-7: retest 3 pairs (base=100, cand=110 each)
-  _MOCK_TP=(    100  110  100 110  100 110  100 110 )
-  _MOCK_RETR=(  0    0    0   0    0   0    0   0   )
-  _MOCK_RTT=(   50000 50000 50000 50000 50000 50000 50000 50000 )
-  _MOCK_BYTES=( 250000000 275000000 250000000 275000000 250000000 275000000 250000000 275000000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_COMMITTED(0)" "0" "$rc"
-  assert_eq "RESULT=committed" "RESULT=committed" "$RESULT_LINE"
-  _cleanup_session
-)
+proxy_service(){
+  setup_mock; install_mock_service; install_mock_commands
+  AT_PROXY_SERVICE=test-proxy.service
+  run_mock_auto
+  assert_eq 'explicit proxy service can be refreshed' 0 "$AUTO_RC"
+  assert_eq 'committed listener uses selected CC' bbr "$(cat "$CASE_TMP/listener-cc")"
+  assert_ok 'generated rollback also restores the listener' bash "$(dirname "$REPORT")/restore.sh"
+  assert_eq 'rolled-back listener uses original CC' cubic "$(cat "$CASE_TMP/listener-cc")"
+}
 
-##############################################################################
-# TEST 2: no_change — all candidates rejected in screening (tp only +2%)
-# 1 candidate (bbr): call 0=baseline, call 1=screening
-##############################################################################
-echo "=== 2. no_change: all candidates below threshold in screening ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  # baseline 100 Mbps, bbr candidate 102 (+2% → below AT_MIN_TP_GAIN=5, no RTT improvement)
-  _MOCK_TP=(    100 102 )
-  _MOCK_RETR=(  0   0   )
-  _MOCK_RTT=(   50000 50000 )
-  _MOCK_BYTES=( 250000000 255000000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_NO_CHANGE(2)" "2" "$rc"
-  assert_eq "RESULT=no_change" "RESULT=no_change" "$RESULT_LINE"
-  _cleanup_session
-)
+proxy_service_failure(){
+  setup_mock; install_mock_service
+  AT_PROXY_SERVICE=test-proxy.service; touch "$CASE_TMP/service-fail"
+  run_mock_auto
+  assert_eq 'failed listener refresh cannot win' 2 "$AUTO_RC"
+  assert_eq 'listener recovered after restart failure' cubic "$(cat "$CASE_TMP/listener-cc")"
+  assert_json 'listener failure reason recorded' "$REPORT" '[.decisions[].reason]|index("proxy_service_restart_failed")!=null'
+}
 
-##############################################################################
-# TEST 3: no_change — candidate passes screening (+10%) but retest median only +2%
-# 1 candidate: call 0=baseline, 1=screening, calls 2-7=retest (base=100, cand=102)
-##############################################################################
-echo "=== 3. no_change: retest insufficient improvement ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  # screening: 110 (+10% → passes), retest: 102 (+2% → below threshold)
-  _MOCK_TP=(    100 110  100 102  100 102  100 102 )
-  _MOCK_RETR=(  0   0    0   0    0   0    0   0   )
-  _MOCK_RTT=(   50000 50000 50000 50000 50000 50000 50000 50000 )
-  _MOCK_BYTES=( 250000000 275000000 250000000 255000000 250000000 255000000 250000000 255000000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_NO_CHANGE(2)" "2" "$rc"
-  assert_eq "RESULT=no_change" "RESULT=no_change" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 4: failed — baseline test fails (call 0 fails)
-##############################################################################
-echo "=== 4. failed: baseline iperf3 fails ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0
-  _MOCK_FAIL=( 0 )  # call index 0 (baseline) fails
-  _MOCK_TP=(   100 110 )
-  _MOCK_RETR=( 0   0   )
-  _MOCK_RTT=(  50000 50000 )
-  _MOCK_BYTES=( 250000000 275000000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_FAILED(1)" "1" "$rc"
-  assert_eq "RESULT=failed" "RESULT=failed" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 5: no_change — apply_cc fails, candidate skipped
-##############################################################################
-echo "=== 5. no_change: apply_cc fails for all candidates ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  # apply_cc always fails → candidate is skipped, no iperf3 call for candidate
-  # Only baseline (1 call) → no candidates qualify → no_change
-  apply_cc(){ return 1; }
-  _MOCK_TP=(    100 )
-  _MOCK_RETR=(  0   )
-  _MOCK_RTT=(   50000 )
-  _MOCK_BYTES=( 250000000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_NO_CHANGE(2)" "2" "$rc"
-  assert_eq "RESULT=no_change" "RESULT=no_change" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 6: failed — persist fails after retest confirms improvement
-##############################################################################
-echo "=== 6. failed: persist_final_atomic fails ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=1; _MOCK_FAIL=()
-  # baseline 100, screening 110, retest 3 pairs all 110
-  _MOCK_TP=( 100 110  100 110  100 110  100 110 )
-  _MOCK_RETR=( 0 0 0 0 0 0 0 0 )
-  _MOCK_RTT=( 50000 50000 50000 50000 50000 50000 50000 50000 )
-  _MOCK_BYTES=( 250000000 275000000 250000000 275000000 250000000 275000000 250000000 275000000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_FAILED(1)" "1" "$rc"
-  assert_eq "RESULT=failed" "RESULT=failed" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 7: no_change — 0.1% tp gain never commits
-##############################################################################
-echo "=== 7. no_change: 0.1% throughput gain is not enough ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  # baseline 100, candidate 100.1 (+0.1% → below AT_MIN_TP_GAIN=5, no RTT gain)
-  _MOCK_TP=(    100 100.1 )
-  _MOCK_RETR=(  0   0     )
-  _MOCK_RTT=(   50000 50000 )
-  _MOCK_BYTES=( 250000000 250250000 )
-  _run_auto; rc=$?
-  assert_eq "exit code is AT_EXIT_NO_CHANGE(2)" "2" "$rc"
-  assert_eq "RESULT=no_change" "RESULT=no_change" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 8: no_change — RTT doubles even though tp +10%: degradation gate blocks
-##############################################################################
-echo "=== 8. no_change: RTT > 200% blocks commit even with tp +10% ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  # baseline: 100Mbps, RTT=50000us
-  # candidates: 110Mbps, RTT=250000us (5× baseline → >200%)
-  _MOCK_TP=( 100 110 )
-  _MOCK_RETR=( 0 0 )
-  _MOCK_RTT=( 50000 250000 )
-  _MOCK_BYTES=( 250000000 275000000 )
-  _run_auto; rc=$?
-  # RTT > 200% base → score_candidate rejects → no candidates pass → no_change
-  assert_eq "exit code is AT_EXIT_NO_CHANGE(2)" "2" "$rc"
-  assert_eq "RESULT=no_change" "RESULT=no_change" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 9: committed — RTT -25% with tp at 97% (above 95%): qualifies as improvement
-##############################################################################
-echo "=== 9. committed: RTT -25% with tp>=95% qualifies ==="
-(
-  _load_tcptune; _single_cand_env
-  _APPLY_CC_FAIL=0; _PERSIST_FAIL=0; _MOCK_FAIL=()
-  AT_MIN_RTT_GAIN=20
-  # baseline: 100Mbps RTT=100000us; candidate: 97Mbps RTT=72000us (-28%)
-  # screening passes (score > 1 because RTT gate lets it through and tp is 97%)
-  # retest: tp median 97 vs base 100 → tp_ratio=0.97 → not 5% gain
-  #   but RTT gain = (1-72/100)*100 = 28% >= 20%, tp >= 95% → qualifies
-  _MOCK_TP=( 100 97  100 97  100 97  100 97 )
-  _MOCK_RETR=( 0 0 0 0 0 0 0 0 )
-  _MOCK_RTT=( 100000 72000  100000 72000  100000 72000  100000 72000 )
-  _MOCK_BYTES=( 250000000 242500000 250000000 242500000 250000000 242500000 250000000 242500000 )
-  _run_auto; rc=$?
-  # RTT -28%, tp 97% (≥95%) → reliable improvement
-  assert_eq "exit code is AT_EXIT_COMMITTED(0)" "0" "$rc"
-  assert_eq "RESULT=committed" "RESULT=committed" "$RESULT_LINE"
-  _cleanup_session
-)
-
-##############################################################################
-# TEST 10: persist preserves prior managed entries when only CC changes
-# Uses real persist_final_atomic with sysctl_value readback returning "bbr"
-##############################################################################
-echo "=== 10. persist_final_atomic preserves prior wmem when only CC changed ==="
-(
-  TCPTUNE="${TCPTUNE:-$(dirname "$0")/../tcptune.sh}"
-  source "$TCPTUNE" 2>/dev/null
-  # Stub sysctl (no-op) and sysctl_value to return "bbr" for readback
-  sysctl(){ :; }
-  sysctl_value(){
-    case "$1" in
-      net.ipv4.tcp_congestion_control) echo "bbr" ;;
-      net.core.default_qdisc) echo "fq_codel" ;;
-      net.ipv4.tcp_wmem) echo "4096 16384 4194304" ;;
-      net.ipv4.tcp_rmem) echo "4096 87380 6291456" ;;
-      *) echo "0" ;;
-    esac
-  }
-  session_restore_runtime(){ return 0; }
-  session_log(){ :; }
-  SESSION_DIR="$(mktemp -d)"
-  CONF="$SESSION_DIR/99-tcptune.conf"
-  # Simulate: previous session had written wmem to orig_persistent.conf
-  printf 'net.ipv4.tcp_wmem = 4096 16384 2097152\n' > "$SESSION_DIR/orig_persistent.conf"
-  printf '' > "$SESSION_DIR/snapshot.conf"
-  # persist CC only (wmem="" rmem="")
-  persist_final_atomic "bbr" "" "" "" 2>/dev/null
-  # conf should contain both CC and preserved wmem
-  if grep -q 'tcp_congestion_control' "$CONF" && \
-     grep -q 'tcp_wmem' "$CONF"; then
-    printf '  PASS: prior wmem preserved when only CC changed\n'; (( PASS++ ))
-  else
-    printf '  FAIL: prior wmem was lost\n'
-    [ -f "$CONF" ] && cat "$CONF" || printf '  (file missing)\n'
-    (( FAIL++ ))
-  fi
-  rm -rf "$SESSION_DIR"
-)
-
-##############################################################################
-# TEST 11: interleaved_retest only counts valid pairs (both sides must succeed)
-##############################################################################
-echo "=== 11. interleaved_retest: incomplete pairs not counted ==="
-(
-  _load_tcptune
-  SESSION_DIR="$(mktemp -d)"
-  printf '' > "$SESSION_DIR/snapshot.conf"
-  BASELINE_THROUGHPUT=100; BASELINE_RETR=0; BASELINE_RTT=50000; BASELINE_BYTES=250000000
-  AT_RETEST_ROUNDS=3
-  _MOCK_CALLS=0
-  # After call 0 (baseline round 1) fails, the pairs are:
-  # Round 1: baseline(idx=0) fails; candidate(idx=1) runs but pair incomplete
-  # Round 2: baseline(idx=2)=100, candidate(idx=3)=110 → valid pair
-  # Round 3: baseline(idx=4)=100, candidate(idx=5)=110 → valid pair
-  _MOCK_FAIL=( 0 )  # first call (baseline round 1) fails
-  _MOCK_TP=( 100   100  100 110  100 110 )
-  _MOCK_RETR=( 0    0    0   0    0   0  )
-  _MOCK_RTT=( 50000 50000 50000 50000 50000 50000 )
-  _MOCK_BYTES=( 250000000 250000000 250000000 275000000 250000000 275000000 )
-  run_iperf3_json(){ _mock_run_iperf3_json "$@"; }
-  RETEST_CAND_TP_MEDIAN=""; RETEST_BASE_TP_MEDIAN=""
-  interleaved_retest "192.0.2.1" "download" "1" "bbr" "fq_codel" "" ""
-  rc=$?
-  # Should still return 0 (2 valid pairs out of 3 rounds is ≥ 2)
-  assert_zero "interleaved_retest returns 0 with 2 valid pairs" "$rc"
-  # Medians should be computed from the 2 valid pairs: base=100, cand=110
-  # Compare numerically (median may be "110.0000" or "110")
-  _median_ok=0
-  awk "BEGIN{exit !(\"$RETEST_CAND_TP_MEDIAN\"+0 == 110)}" && _median_ok=1
-  assert_zero "candidate TP median from valid pairs equals 110" "$(( 1 - _median_ok ))"
-  rm -rf "$SESSION_DIR"
-)
-
-##############################################################################
-# TEST 12: restore.sh NOT deleted after successful commit
-##############################################################################
-echo "=== 12. restore.sh preserved after commit ==="
-(
-  _load_tcptune
-  SESSION_DIR="$(mktemp -d)"
-  printf 'net.ipv4.tcp_congestion_control = cubic\n' > "$SESSION_DIR/snapshot.conf"
-  printf '' > "$SESSION_DIR/orig_persistent.conf"
-  printf 'absent' > "$SESSION_DIR/orig_persistent.status"
-  printf '#!/bin/bash\necho restore\n' > "$SESSION_DIR/restore.sh"
-  CONF="$SESSION_DIR/99-tcptune.conf"
-  _PERSIST_FAIL=0
-  persist_final_atomic(){ printf 'net.ipv4.tcp_congestion_control = bbr\n' > "$CONF"; return 0; }
-  _finalize_and_persist "bbr" "" "" "" >/dev/null 2>&1
-  if [ -f "$SESSION_DIR/restore.sh" ]; then
-    printf '  PASS: restore.sh preserved after successful commit\n'; (( PASS++ ))
-  else
-    printf '  FAIL: restore.sh was deleted after commit\n'; (( FAIL++ ))
-  fi
-  rm -rf "$SESSION_DIR"
-)
-
-##############################################################################
-# TEST 13: AT_AUTO=1 exits with RESULT=failed (no pause) when not root
-##############################################################################
-echo "=== 13. auto mode: no pause when require_root fails ==="
-(
-  _load_tcptune
-  # Override require_root to fail
-  require_root(){ return 1; }
-  AT_AUTO=1
-  AT_TARGET="192.0.2.1"
-  out="$(auto_tune_flow 2>/dev/null)"
-  rc=$?
-  RESULT_LINE="$(printf '%s\n' "$out" | grep '^RESULT=' | tail -1)"
-  assert_eq "exit code is AT_EXIT_FAILED(1)" "1" "$rc"
-  assert_eq "RESULT=failed when not root" "RESULT=failed" "$RESULT_LINE"
-)
-
-##############################################################################
-# TEST 14: wmem readback failure prevents commit
-##############################################################################
-echo "=== 14. persist: wmem readback mismatch blocks commit ==="
-(
-  TCPTUNE="${TCPTUNE:-$(dirname "$0")/../tcptune.sh}"
-  source "$TCPTUNE" 2>/dev/null
-  SESSION_DIR="$(mktemp -d)"
-  CONF="$SESSION_DIR/99-tcptune.conf"
-  printf '' > "$SESSION_DIR/orig_persistent.conf"
-  printf '' > "$SESSION_DIR/snapshot.conf"
-  # sysctl no-op; readback returns mismatch for wmem (kernel rejected the value)
-  sysctl(){ :; }
-  sysctl_value(){
-    case "$1" in
-      net.ipv4.tcp_wmem) echo "4096 16384 999999" ;;  # mismatch: kernel returned different value
-      net.ipv4.tcp_congestion_control) echo "bbr" ;;
-      *) echo "" ;;
-    esac
-  }
-  _restore_orig_persistent(){ return 0; }
-  session_restore_runtime(){ return 0; }
-  session_log(){ :; }
-  persist_final_atomic "bbr" "" "2097152" "" 2>/dev/null
-  rc=$?
-  assert_nonzero "persist_final_atomic fails when wmem readback mismatches" "$rc"
-  rm -rf "$SESSION_DIR"
-)
-
-##############################################################################
-echo
-echo "=== 结果: PASS=${PASS}  FAIL=${FAIL}  SKIP=${SKIP} ==="
-[ "$FAIL" -eq 0 ] && exit 0 || exit 1
+run_case committed committed
+run_case no-persist temporary
+run_case negligible-gain unchanged
+run_case latency-branch latency
+run_case latency-regression bad_latency
+run_case late-retransmissions late_retrans
+run_case independent-holdout holdout
+run_case apply-failure application_failures
+run_case readback-mismatch readback
+run_case retest-apply-failure retest_apply
+run_case final-apply-failure final_apply
+run_case baseline-failure baseline_failure
+run_case missing-pairs missing_pairs
+run_case persist-failure persist_failure
+run_case restore-failure restore_failure
+run_case sender-direction receiver
+run_case budget-preflight budget_preflight
+run_case real-json-parser json_parser
+run_case buffer-write-failure buffer_apply_failure
+run_case remote-commit-guard unsupported_remote
+run_case standalone-rollback standalone_restore
+run_case multiple-candidates multiple_candidates
+run_case noisy-pairs noisy
+run_case signal-rollback interrupted
+run_case report-failure report_failure
+run_case proxy-service-refresh proxy_service
+run_case proxy-service-failure proxy_service_failure
+finish_suite
