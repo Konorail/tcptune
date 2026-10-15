@@ -19,8 +19,8 @@ XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 MIB=$((1024 * 1024))
 MIN_WINDOW=87380
 SSH_CONNECT_TIMEOUT=8
-SCRIPT_VERSION="v1.1.0"
-SCRIPT_DATE="2026-05-28"
+SCRIPT_VERSION="v2.0.0"
+SCRIPT_DATE="2026-10-15"
 
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 red(){ printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -747,121 +747,386 @@ check_remote_local_env(){
   fi
 }
 
-save_baseline_once(){
+
+##############################################################################
+# 会话快照系统（每次运行创建独立快照，不复用旧快照）
+##############################################################################
+
+SESSION_DIR=""
+SESSIONS_BASE="$STATE_DIR/sessions"
+LOCK_HELD=0
+WATCHDOG_PID=""
+AT_MAX_CANDIDATES=8
+AT_DURATION=20
+AT_BUDGET_GIB=2
+BUDGET_USED_BYTES=0
+BASELINE_THROUGHPUT=0
+BASELINE_RETR=0
+BASELINE_RTT=0
+BASELINE_BYTES=0
+BUFFER_LIMITED=0
+ACTUAL_IFACE=""
+ACTUAL_QDISC=""
+IPERF_THROUGHPUT=0
+IPERF_RETR=0
+IPERF_RTT=0
+CANDIDATE_SCORE=""
+SCORE_REJECT_REASON=""
+
+session_create(){
   require_root || return 1
-  mkdir -p "$STATE_DIR" || return 1
-  if [ -f "$BASELINE" ]; then
-    yellow "已存在回滚基线：$BASELINE（不会覆盖）。"
-    return 0
-  fi
+  mkdir -p "$SESSIONS_BASE" || return 1
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)-$$"
+  SESSION_DIR="$SESSIONS_BASE/$ts"
+  mkdir -p "$SESSION_DIR" || return 1
   {
-    printf '# tcptune baseline captured before tuning\n'
-    printf 'net.core.default_qdisc = %s\n' "$(sysctl_value net.core.default_qdisc)"
-    printf 'net.ipv4.tcp_congestion_control = %s\n' "$(sysctl_value net.ipv4.tcp_congestion_control)"
-    printf 'net.ipv4.tcp_wmem = %s\n' "$(sysctl_value net.ipv4.tcp_wmem)"
-    printf 'net.ipv4.tcp_rmem = %s\n' "$(sysctl_value net.ipv4.tcp_rmem)"
-  } > "$BASELINE" || return 1
-  green "已保存回滚基线：$BASELINE"
+    printf '# tcptune session snapshot: %s\n' "$(date)"
+    printf 'net.core.default_qdisc = %s\n'                 "$(sysctl_value net.core.default_qdisc)"
+    printf 'net.ipv4.tcp_congestion_control = %s\n'        "$(sysctl_value net.ipv4.tcp_congestion_control)"
+    printf 'net.ipv4.tcp_wmem = %s\n'                      "$(sysctl_value net.ipv4.tcp_wmem)"
+    printf 'net.ipv4.tcp_rmem = %s\n'                      "$(sysctl_value net.ipv4.tcp_rmem)"
+    printf 'net.core.rmem_max = %s\n'                      "$(sysctl_value net.core.rmem_max)"
+    printf 'net.core.wmem_max = %s\n'                      "$(sysctl_value net.core.wmem_max)"
+  } > "$SESSION_DIR/snapshot.conf" || return 1
+  printf 'results_header\n' > "$SESSION_DIR/results.tsv"
+  printf 'label\tthroughput_mbps\tretr\trtt_us\tscore\tstatus\n' >> "$SESSION_DIR/results.tsv"
+  touch "$SESSION_DIR/session.log"
+  if [ -f "$CONF" ]; then
+    cp "$CONF" "$SESSION_DIR/orig_persistent.conf"
+    printf 'exists\n' > "$SESSION_DIR/orig_persistent.status"
+  else
+    printf 'absent\n' > "$SESSION_DIR/orig_persistent.status"
+  fi
+  # 写入恢复脚本（持久化成功后删除）
+  cat > "$SESSION_DIR/restore.sh" << 'RESTORE_INNER'
+#!/usr/bin/env bash
+set -e
+src="$(dirname "$(readlink -f "$0")")"
+snap="$src/snapshot.conf"
+orig_status="$src/orig_persistent.status"
+orig_conf="$src/orig_persistent.conf"
+conf="/etc/sysctl.d/99-tcptune.conf"
+[ -f "$snap" ] || exit 1
+while IFS=' = ' read -r key value; do
+  [[ "$key" =~ ^# ]] && continue
+  [[ -z "$key" ]] && continue
+  sysctl -w "${key// /}=${value// /}" >/dev/null 2>&1 || true
+done < "$snap"
+status="$(cat "$orig_status" 2>/dev/null)"
+if [ "$status" = "exists" ] && [ -f "$orig_conf" ]; then
+  cp "$orig_conf" "$conf"
+elif [ "$status" = "absent" ]; then
+  rm -f "$conf"
+fi
+sysctl --system >/dev/null 2>&1 || true
+echo "已恢复会话快照。"
+RESTORE_INNER
+  chmod +x "$SESSION_DIR/restore.sh"
+  ln -snf "$SESSION_DIR" "$SESSIONS_BASE/latest" 2>/dev/null || true
+  green "已创建会话快照：$SESSION_DIR"
 }
+
+session_restore_runtime(){
+  local snap="$SESSION_DIR/snapshot.conf"
+  [ -f "$snap" ] || { red "找不到会话快照：$snap"; return 1; }
+  while IFS=' = ' read -r key value; do
+    [[ "$key" =~ ^# ]] && continue
+    [[ -z "${key// /}" ]] && continue
+    sysctl -w "${key// /}=${value// /}" >/dev/null 2>&1 || true
+  done < "$snap"
+}
+
+session_log(){
+  [ -n "$SESSION_DIR" ] && printf '%s\n' "$*" >> "$SESSION_DIR/session.log" || true
+}
+
+##############################################################################
+# 进程锁
+##############################################################################
+
+lock_acquire(){
+  mkdir -p "$STATE_DIR" || return 1
+  local lockfile="$STATE_DIR/tuning.lock"
+  if [ -f "$lockfile" ]; then
+    local pid
+    pid="$(cat "$lockfile" 2>/dev/null || echo "")"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      red "另一个调优进程正在运行（PID $pid），请等待其完成后再试。"
+      return 1
+    fi
+    yellow "发现陈旧锁文件（PID ${pid:-?} 已不存在），清除后继续。"
+    rm -f "$lockfile"
+  fi
+  printf '%s\n' "$$" > "$lockfile" || return 1
+  LOCK_HELD=1
+}
+
+lock_release(){
+  [ "${LOCK_HELD:-0}" -eq 1 ] || return 0
+  rm -f "$STATE_DIR/tuning.lock"
+  LOCK_HELD=0
+}
+
+##############################################################################
+# Watchdog 守护进程
+##############################################################################
+
+watchdog_start(){
+  local restore_script="$1"
+  [ -f "$restore_script" ] || return 1
+  local parent_pid=$$
+  (
+    while kill -0 "$parent_pid" 2>/dev/null; do
+      sleep 5
+    done
+    [ -f "$restore_script" ] && bash "$restore_script" >/dev/null 2>&1 || true
+  ) &
+  WATCHDOG_PID=$!
+  disown "$WATCHDOG_PID" 2>/dev/null || true
+}
+
+watchdog_stop(){
+  if [ -n "$WATCHDOG_PID" ]; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=""
+  fi
+}
+
+##############################################################################
+# 实际出口接口与 qdisc 检查
+##############################################################################
+
+check_actual_qdisc(){
+  local iface qdisc
+  iface="$(ip route show default 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [ -z "$iface" ]; then
+    yellow "无法确定默认出口接口，跳过实际 qdisc 检查。"
+    ACTUAL_IFACE=""
+    ACTUAL_QDISC=""
+    return 1
+  fi
+  ACTUAL_IFACE="$iface"
+  qdisc="$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')"
+  ACTUAL_QDISC="${qdisc:-unknown}"
+  printf '默认出口接口: %s，当前实际 qdisc: %s\n' "$iface" "$ACTUAL_QDISC"
+}
+
+##############################################################################
+# 恢复基线（兼容旧 BASELINE 文件和新会话快照）
+##############################################################################
 
 restore_baseline(){
   clear_screen
   require_root || { pause; return; }
   if [ -f "$MYSTERY_CONF" ]; then
     red "当前存在迷之调参持久化配置：$MYSTERY_CONF"
-    yellow "迷之调参配置会覆盖部分基线参数，请使用“一键卸载附加组件并恢复初始化状态”完整回滚。"
-    pause
-    return
+    yellow "迷之调参配置会覆盖部分基线参数，请使用"一键卸载附加组件并恢复初始化状态"完整回滚。"
+    pause; return
   fi
-  if [ ! -f "$BASELINE" ]; then
-    red "未找到回滚基线：$BASELINE"
-    pause
-    return
+  local restore_src=""
+  # 优先使用最新会话快照
+  if [ -L "$SESSIONS_BASE/latest" ] && [ -f "$SESSIONS_BASE/latest/restore.sh" ]; then
+    restore_src="$SESSIONS_BASE/latest/restore.sh"
+    yellow "将从最新会话快照恢复：$SESSIONS_BASE/latest/"
+  elif [ -f "$BASELINE" ]; then
+    # 兼容旧格式：BASELINE 文件
+    restore_src="__legacy__"
+    yellow "将从旧基线文件恢复：$BASELINE（不存在新会话快照）"
+  else
+    red "未找到任何可用基线或会话快照。"
+    pause; return
   fi
-  yellow "将用已保存的基线替换 $CONF 并应用。"
   read -rp "确认恢复？[y/N]: " yn
   if [[ "$yn" =~ ^[Yy]$ ]]; then
-    cp "$BASELINE" "$CONF" && sysctl --system &&
-      green "已恢复基线配置。" || red "恢复失败，请检查系统输出。"
+    if [ "$restore_src" = "__legacy__" ]; then
+      cp "$BASELINE" "$CONF" && sysctl --system && green "已恢复旧基线配置。" || red "恢复失败。"
+    else
+      bash "$restore_src" && green "已恢复会话快照。" || red "恢复失败。"
+    fi
   fi
   pause
 }
 
-prepare_bbr_fq(){
-  local available cc qdisc yn
-  available="$(sysctl_value net.ipv4.tcp_available_congestion_control)"
-  cc="$(sysctl_value net.ipv4.tcp_congestion_control)"
-  qdisc="$(sysctl_value net.core.default_qdisc)"
-  echo
-  green "拥塞控制与默认队列检查"
-  printf '可用拥塞控制算法: %s\n当前拥塞控制算法: %s\n当前默认 qdisc: %s\n' "$available" "$cc" "$qdisc"
-  if [[ " $available " != *" bbr "* ]]; then
-    red "当前内核未报告 bbr 可用，无法按文章的 bbr + fq 前提继续。"
-    return 1
-  fi
-  if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
-    green "已启用 bbr + fq。"
-    return 0
-  fi
-  read -rp "是否临时启用 bbr + fq 进行本次测试？[Y/n]: " yn
-  if [[ "$yn" =~ ^[Nn]$ ]]; then
-    red "未启用 bbr + fq，已取消文章方案一调优流程。"
-    return 1
-  fi
-  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null &&
-    sysctl -w net.core.default_qdisc=fq >/dev/null || {
-      red "设置 bbr + fq 失败。"
-      return 1
-    }
-  yellow "已设置默认 qdisc=fq；既有接口的当前 qdisc 请通过状态菜单核对。"
+##############################################################################
+# 参数应用函数（分别调整，有依据时才调整）
+##############################################################################
+
+apply_cc(){
+  local cc="$1"
+  sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1
 }
 
-show_client_command(){
-  local host="$1" direction="$2" duration="$3"
-  if [ "$direction" = "download" ]; then
-    printf 'iperf3 -c %s -R -t %s\n' "$host" "$duration"
+apply_qdisc(){
+  local qdisc="$1"
+  sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1
+}
+
+apply_wmem(){
+  local wmax="$1"
+  sysctl -w "net.ipv4.tcp_wmem=4096 16384 $wmax" >/dev/null 2>&1
+}
+
+apply_rmem(){
+  local rmax="$1"
+  sysctl -w "net.ipv4.tcp_rmem=4096 87380 $rmax" >/dev/null 2>&1
+}
+
+##############################################################################
+# iperf3 JSON 自动测试
+##############################################################################
+
+# 全局流量预算追踪（字节）
+_at_budget_add(){
+  local bytes="${1:-0}"
+  BUDGET_USED_BYTES=$(( BUDGET_USED_BYTES + bytes ))
+}
+
+run_iperf3_json(){
+  # $1=target $2=direction(download|upload) $3=duration $4=parallel
+  local target="$1" direction="${2:-download}" duration="${3:-20}" parallel="${4:-1}"
+  local args=("-c" "$target" "-J" "-t" "$duration")
+  [ "$direction" = "download" ] && args+=("-R")
+  [ "$parallel" -gt 1 ] && args+=("-P" "$parallel")
+  local json
+  json="$(iperf3 "${args[@]}" 2>/dev/null)"
+  local rc=$?
+  if [ $rc -ne 0 ] || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    IPERF_THROUGHPUT=0; IPERF_RETR=0; IPERF_RTT=0; IPERF_BYTES=0
+    return 1
+  fi
+  local bps retr rtt bytes
+  bps="$(printf '%s' "$json" | jq -r '.end.sum_received.bits_per_second // .end.sum.bits_per_second // 0')"
+  retr="$(printf '%s' "$json" | jq -r '.end.sum_sent.retransmits // 0')"
+  rtt="$(printf '%s' "$json" | jq -r '[.end.streams[]?.sender.mean_rtt // empty] | if length>0 then (add/length) else 0 end' 2>/dev/null || echo 0)"
+  bytes="$(printf '%s' "$json" | jq -r '.end.sum_received.bytes // .end.sum.bytes // 0')"
+  IPERF_THROUGHPUT="$(awk "BEGIN{printf \"%.2f\", ${bps:-0} / 1000000}")"
+  IPERF_RETR="${retr:-0}"
+  IPERF_RTT="$(awk "BEGIN{printf \"%.0f\", ${rtt:-0}}")"
+  IPERF_BYTES="${bytes:-0}"
+  _at_budget_add "${bytes:-0}"
+  return 0
+}
+
+##############################################################################
+# 诊断性缓冲测试（判断是否存在缓冲瓶颈）
+##############################################################################
+
+run_diagnostic_buffer_test(){
+  local target="$1" direction="$2" duration="$3"
+  green "运行诊断性缓冲测试（单流 vs 并发）..."
+  run_iperf3_json "$target" "$direction" "$duration" 1
+  local single_tp="$IPERF_THROUGHPUT"
+  run_iperf3_json "$target" "$direction" "$duration" 4
+  local parallel_tp="$IPERF_THROUGHPUT"
+  BUFFER_LIMITED=0
+  if awk "BEGIN{exit !($single_tp > 0 && $parallel_tp / ($single_tp + 0.001) > 1.3 && $parallel_tp > 10)}"; then
+    BUFFER_LIMITED=1
+    printf '诊断：并发 %.1f Mbps > 单流 %.1f Mbps（比值 %.2f），存在缓冲瓶颈\n' \
+      "$parallel_tp" "$single_tp" \
+      "$(awk "BEGIN{printf \"%.2f\", $parallel_tp / ($single_tp + 0.001)}")"
   else
-    printf 'iperf3 -c %s -t %s\n' "$host" "$duration"
+    printf '诊断：并发/单流比 %.2f，无明显缓冲瓶颈证据（不生成缓冲候选）\n' \
+      "$(awk "BEGIN{printf \"%.2f\", $parallel_tp / ($single_tp + 0.001)}")"
   fi
 }
 
-apply_window(){
-  local value="$1"
-  sysctl -w net.ipv4.tcp_wmem="4096 16384 $value" >/dev/null &&
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 $value" >/dev/null
+##############################################################################
+# 评分函数
+##############################################################################
+
+score_candidate(){
+  # $1=throughput $2=retr $3=rtt_us $4=base_tp $5=base_retr $6=base_rtt $7=base_bytes
+  local tp="$1" retr="$2" rtt_us="$3"
+  local base_tp="$4" base_retr="$5" base_rtt_us="$6" base_bytes="$7"
+  CANDIDATE_SCORE=-1
+  SCORE_REJECT_REASON=""
+  # 门槛 1：吞吐 >= 基线 95%
+  local min_tp
+  min_tp="$(awk "BEGIN{printf \"%.4f\", $base_tp * 0.95}")"
+  if awk "BEGIN{exit !($tp < $min_tp)}"; then
+    SCORE_REJECT_REASON="吞吐量低于基线 95%（${tp} < ${min_tp} Mbps）"
+    return 1
+  fi
+  # 归一化重传率（per GB 发送量）
+  local norm_retr base_norm_retr eps=0.001
+  norm_retr="$(awk "BEGIN{printf \"%.6f\", $retr / (${IPERF_BYTES:-1} / 1073741824.0 + $eps)}")"
+  base_norm_retr="$(awk "BEGIN{printf \"%.6f\", $base_retr / ($base_bytes / 1073741824.0 + $eps)}")"
+  # 门槛 2：归一化重传率 <= 基线 3 倍（且绝对值 > 1 才检查）
+  if awk "BEGIN{exit !($norm_retr > $base_norm_retr * 3 && $norm_retr > 1)}"; then
+    SCORE_REJECT_REASON="归一化重传率超过基线 3 倍（${norm_retr} vs ${base_norm_retr}）"
+    return 1
+  fi
+  # 门槛 3：满载 RTT <= 基线 200%（仅在两者均 > 0 时检查）
+  if awk "BEGIN{exit !($rtt_us > 0 && $base_rtt_us > 0)}"; then
+    local max_rtt
+    max_rtt="$(awk "BEGIN{printf \"%.0f\", $base_rtt_us * 2}")"
+    if awk "BEGIN{exit !($rtt_us > $max_rtt)}"; then
+      SCORE_REJECT_REASON="满载 RTT 超过基线 200%（${rtt_us} > ${max_rtt} us）"
+      return 1
+    fi
+  fi
+  # 综合评分
+  local safe_norm_retr
+  safe_norm_retr="$(awk "BEGIN{printf \"%.6f\", ($norm_retr > $eps) ? $norm_retr : $eps}")"
+  CANDIDATE_SCORE="$(awk "BEGIN{printf \"%.4f\", $tp * 0.7 + (1.0 / $safe_norm_retr) * 0.3}")"
+  return 0
 }
 
-collect_test_result(){
-  local candidate="$1" command="$2" throughput retr shake
-  echo
-  green "请在客户端执行本轮测试"
-  printf '%s\n' "$command"
-  read_positive "输入本轮平均吞吐 Mbps" ""
-  throughput="$REPLY"
-  while true; do
-    read -rp "输入本轮 Retr 重传数: " retr
-    [[ "$retr" =~ ^[0-9]+$ ]] && break
-    red "请输入非负整数。"
-  done
-  read -rp "本轮是否出现明显速度抖动或断流？[y/N]: " shake
-  [[ "$shake" =~ ^[Yy]$ ]] && shake="yes" || shake="no"
-  printf '%s\t%s\t%s\t%s\n' "$candidate" "$throughput" "$retr" "$shake" >> "$SESSION_LOG"
-  RESULT_THROUGHPUT="$throughput"
-  RESULT_RETR="$retr"
-  RESULT_SHAKE="$shake"
-}
+##############################################################################
+# 原子持久化 + 读回核对
+##############################################################################
 
-persist_final(){
-  local value="$1"
+persist_final_atomic(){
+  local cc="${1:-}" qdisc="${2:-}" wmem_max="${3:-}" rmem_max="${4:-}"
+  local tmpconf
+  tmpconf="$(mktemp "${CONF}.XXXXXX")" || return 1
   {
-    printf '# Managed by tcptune. Validated through the interactive iperf3 workflow.\n'
-    printf 'net.core.default_qdisc = fq\n'
-    printf 'net.ipv4.tcp_congestion_control = bbr\n'
-    printf 'net.ipv4.tcp_wmem = 4096 16384 %s\n' "$value"
-    printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n' "$value"
-  } > "$CONF" &&
-    sysctl --system
+    printf '# Managed by tcptune auto-tune (session: %s)\n' "${SESSION_DIR##*/}"
+    printf '# Applied: %s\n' "$(date)"
+    [ -n "$cc"       ] && printf 'net.ipv4.tcp_congestion_control = %s\n' "$cc"
+    [ -n "$qdisc"    ] && printf 'net.core.default_qdisc = %s\n'          "$qdisc"
+    [ -n "$wmem_max" ] && printf 'net.ipv4.tcp_wmem = 4096 16384 %s\n'    "$wmem_max"
+    [ -n "$rmem_max" ] && printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n'    "$rmem_max"
+  } > "$tmpconf" || { rm -f "$tmpconf"; return 1; }
+  mv "$tmpconf" "$CONF" || { rm -f "$tmpconf"; return 1; }
+  if ! sysctl --system >/dev/null 2>&1; then
+    red "sysctl --system 失败，尝试恢复原配置..."
+    _restore_orig_persistent
+    sysctl --system >/dev/null 2>&1 || true
+    return 1
+  fi
+  # 逐项读回核对
+  local ok=1
+  if [ -n "$cc" ]; then
+    local actual; actual="$(sysctl_value net.ipv4.tcp_congestion_control)"
+    [ "$actual" != "$cc" ] && { red "核对失败: tcp_congestion_control 期望=$cc 实际=$actual"; ok=0; }
+  fi
+  if [ -n "$qdisc" ]; then
+    local actual; actual="$(sysctl_value net.core.default_qdisc)"
+    [ "$actual" != "$qdisc" ] && { red "核对失败: default_qdisc 期望=$qdisc 实际=$actual"; ok=0; }
+  fi
+  if [ "$ok" -eq 0 ]; then
+    red "读回核对失败，恢复原配置和运行状态..."
+    _restore_orig_persistent
+    sysctl --system >/dev/null 2>&1 || true
+    session_restore_runtime
+    return 1
+  fi
+  return 0
 }
+
+_restore_orig_persistent(){
+  local status
+  status="$(cat "$SESSION_DIR/orig_persistent.status" 2>/dev/null)"
+  if [ "$status" = "exists" ] && [ -f "$SESSION_DIR/orig_persistent.conf" ]; then
+    cp "$SESSION_DIR/orig_persistent.conf" "$CONF"
+  elif [ "$status" = "absent" ]; then
+    rm -f "$CONF"
+  fi
+}
+
 
 mystery_read_decimal(){
   local prompt="$1" default="$2" min="$3" max="$4" value
@@ -1403,156 +1668,363 @@ mystery_tune_menu(){
   done
 }
 
-tune_flow(){
-  local host direction duration client_bw vps_bw rtt bottleneck bdp candidate
-  local mib_value choice applied last_good="" next_step margin final_candidate command
+
+##############################################################################
+# 自动调优流程（替代旧 tune_flow）
+##############################################################################
+
+# 命令行参数覆盖（可在调用前设置）
+# AT_MAX_CANDIDATES N  AT_DURATION N  AT_BUDGET_GIB N
+
+_at_cleanup(){
+  local reason="${1:-}"
+  trap - INT TERM EXIT
+  watchdog_stop
+  # 若非正常持久化成功，恢复运行状态
+  if [ "$reason" != "success" ] && [ -n "$SESSION_DIR" ] && [ -f "$SESSION_DIR/snapshot.conf" ]; then
+    session_restore_runtime
+  fi
+  lock_release
+  [ -n "$SESSION_DIR" ] && session_log "cleanup reason=$reason"
+}
+
+auto_tune_flow(){
   clear_screen
-  green "文章方案一：BDP 起点 + iperf3 交互调优"
-  echo "说明：脚本运行在 VPS；带宽与 RTT 必须对应客户端和该 VPS 的目标链路。"
-  echo "公网 speedtest 的结果不会作为 BDP 输入。"
+  green "自动调优流程（VLESS/Xray 代理 VPS 优化）"
+  echo "说明：自动生成并测试候选配置，选出最佳配置后持久化。"
   echo
+
+  # 环境检查
+  require_root || { pause; return; }
   if [ -f "$MYSTERY_CONF" ]; then
     red "检测到已启用的迷之调参持久化配置：$MYSTERY_CONF"
-    yellow "请先执行初始化恢复移除迷之调参配置，再使用交互实测调优流程。"
-    pause
-    return
+    yellow "请先执行初始化恢复移除迷之调参配置，再使用自动调优流程。"
+    pause; return
   fi
-  require_root || { pause; return; }
-  has sysctl && has awk && has iperf3 || {
-    red "缺少必要命令，请先运行“环境检查 / 安装依赖”。"
-    pause
-    return
-  }
-  save_baseline_once || { red "保存基线失败，取消调优。"; pause; return; }
-  prepare_bbr_fq || { pause; return; }
+  for _cmd in sysctl awk iperf3 tc ip jq; do
+    if ! has "$_cmd"; then
+      red "缺少必要命令：$_cmd，请先运行"环境检查 / 安装依赖"。"
+      pause; return
+    fi
+  done
 
-  echo
-  read -rp "输入 VPS 公网 IP 或域名（用于生成客户端命令）: " host
-  if [ -z "$host" ]; then
-    red "VPS 地址不能为空。"
-    pause
-    return
-  fi
-  echo "选择本次优化方向："
-  echo "1. VPS -> 客户端（下载，文章主要场景）"
+  # 进程锁
+  lock_acquire || { pause; return; }
+  # 会话快照
+  session_create || { lock_release; red "无法创建会话快照，取消调优。"; pause; return; }
+
+  # 设置 trap
+  trap '_at_cleanup interrupted' INT TERM
+  trap '_at_cleanup exit'        EXIT
+
+  # 启动 watchdog
+  watchdog_start "$SESSION_DIR/restore.sh"
+
+  BUDGET_USED_BYTES=0
+  local budget_bytes
+  budget_bytes=$(( AT_BUDGET_GIB * 1024 * 1024 * 1024 ))
+  local screen_budget=$(( budget_bytes * 60 / 100 ))
+
+  # 出口接口 qdisc 实情检查
+  check_actual_qdisc
+
+  # 选择测试目标
+  local target direction duration
+  direction="download"
+  duration="$AT_DURATION"
+
+  echo "选择测试方向："
+  echo "1. VPS -> 客户端（下载，主要场景）"
   echo "2. 客户端 -> VPS（上传）"
   while true; do
-    read -rp "请选择 [1-2]: " choice
-    case "$choice" in
+    read -rp "请选择 [1-2]: " _choice
+    case "$_choice" in
       1) direction="download"; break ;;
       2) direction="upload"; break ;;
       *) red "请选择 1 或 2。" ;;
     esac
   done
-  read_positive_integer "输入每轮 iperf3 测试时长（秒）" "30"
-  duration="$REPLY"
-  command="$(show_client_command "$host" "$direction" "$duration")"
 
   echo
-  green "在客户端准备好 iperf3 后，将使用以下命令测试："
-  printf '%s\n' "$command"
-  echo "VPS 端需保持运行：iperf3 -s"
-  echo
-  read_positive "输入客户端在本方向的有效带宽 Mbps" ""
-  client_bw="$REPLY"
-  read_positive "输入 VPS 在本方向的端口/有效带宽 Mbps" ""
-  vps_bw="$REPLY"
-  echo "请从客户端 ping 本 VPS；ping 输出已经是往返时延，无需乘 2。"
-  read_positive "输入客户端到 VPS 的平均 RTT ms" ""
-  rtt="$REPLY"
-
-  bottleneck="$(awk "BEGIN{print ($client_bw < $vps_bw) ? $client_bw : $vps_bw}")"
-  bdp="$(awk "BEGIN{printf \"%.0f\", $bottleneck * 1000000 * ($rtt / 1000) / 8}")"
-  [ "$bdp" -lt "$MIN_WINDOW" ] && bdp="$MIN_WINDOW"
-  mib_value="$(awk "BEGIN{printf \"%.2f\", $bdp / $MIB}")"
-  echo
-  green "BDP 理论起点"
-  printf '客户端有效带宽: %s Mbps\nVPS 有效带宽: %s Mbps\n采用瓶颈带宽: %s Mbps\nRTT: %s ms\n' \
-    "$client_bw" "$vps_bw" "$bottleneck" "$rtt"
-  printf 'BDP = %s Byte (约 %s MiB)\n' "$bdp" "$mib_value"
-  yellow "BDP 仅为测试起点，最终参数必须经过 iperf3 验证。"
-  echo
-  echo "1. 使用 BDP 理论值作为初始候选"
-  echo "2. 手动输入初始最大缓冲区字节数"
+  echo "选择测试方式："
+  echo "1. 本地回环（127.0.0.1，无需远程节点，结果仅供内核参数对比参考）"
+  echo "2. 指定远程 iperf3 测试节点 IP/域名"
   echo "0. 取消"
-  read -rp "请选择 [0-2]: " choice
-  case "$choice" in
-    1) candidate="$bdp" ;;
-    2)
-      read_positive_integer "输入初始最大缓冲区 Byte" ""
-      candidate="$REPLY"
-      [ "$candidate" -lt "$MIN_WINDOW" ] && candidate="$MIN_WINDOW"
+  read -rp "请选择 [0-2]: " _choice
+  case "$_choice" in
+    1)
+      target="127.0.0.1"
+      yellow "注意：本地回环测试不经过真实网络路径，结果仅供内核参数对比参考，不代表出口性能。"
       ;;
-    *) pause; return ;;
+    2)
+      while true; do
+        read -rp "输入远程 iperf3 服务器 IP/域名: " target
+        valid_target_host "$target" && [ -n "$target" ] && break
+        red "地址格式不合法。"
+      done
+      ;;
+    *) _at_cleanup cancelled; trap - INT TERM EXIT; pause; return ;;
   esac
 
-  mkdir -p "$STATE_DIR" || { red "无法创建状态目录。"; pause; return; }
-  printf 'window_bytes\tthroughput_mbps\tretr\tshake_or_disconnect\n' > "$SESSION_LOG"
-  while true; do
-    mib_value="$(awk "BEGIN{printf \"%.2f\", $candidate / $MIB}")"
-    echo
-    yellow "候选最大缓冲区：$candidate Byte（约 $mib_value MiB）"
-    read -rp "是否临时应用该候选值并测试？[Y/n/q]: " applied
-    [[ "$applied" =~ ^[Qq]$ ]] && break
-    [[ "$applied" =~ ^[Nn]$ ]] && continue
-    if ! apply_window "$candidate"; then
-      red "临时设置失败，取消本轮。"
+  # 检测是否需要启动本地 iperf3 服务端
+  local _local_server_pid=""
+  if [ "$target" = "127.0.0.1" ]; then
+    iperf3 -s -D -p 5201 >/dev/null 2>&1; sleep 1
+    _local_server_pid="$(pgrep -n iperf3 2>/dev/null || true)"
+  fi
+
+  # 测量空闲 RTT
+  local idle_rtt=50
+  if [ "$target" != "127.0.0.1" ]; then
+    local _prtt
+    _prtt="$(ping -c 5 -q "$target" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')"
+    if [[ "$_prtt" =~ ^[0-9]+$ ]] && [ "$_prtt" -gt 0 ]; then
+      idle_rtt="$_prtt"
+    fi
+  fi
+  printf '空闲 RTT: %s ms\n' "$idle_rtt"
+  session_log "target=$target direction=$direction idle_rtt=${idle_rtt}ms"
+
+  # 基线测试
+  green "--- 基线测试 ---"
+  if ! run_iperf3_json "$target" "$direction" "$duration" 1; then
+    red "基线测试失败，无法继续。"
+    [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
+    _at_cleanup failed; trap - INT TERM EXIT; pause; return
+  fi
+  BASELINE_THROUGHPUT="$IPERF_THROUGHPUT"
+  BASELINE_RETR="$IPERF_RETR"
+  BASELINE_RTT="$IPERF_RTT"
+  BASELINE_BYTES="$(awk "BEGIN{printf \"%.0f\", $BASELINE_THROUGHPUT * 1000000 / 8 * $duration + 1}")"
+  printf '基线：吞吐 %s Mbps，Retr=%s，RTT=%s us\n' \
+    "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT"
+  session_log "baseline throughput=${BASELINE_THROUGHPUT}Mbps retr=$BASELINE_RETR rtt=${BASELINE_RTT}us"
+
+  # 当前 CC/qdisc
+  local current_cc current_qdisc available_cc
+  current_cc="$(sysctl_value net.ipv4.tcp_congestion_control)"
+  current_qdisc="$(sysctl_value net.core.default_qdisc)"
+  available_cc="$(sysctl_value net.ipv4.tcp_available_congestion_control)"
+
+  # 诊断性缓冲测试（只在吞吐 > 5 Mbps 且有意义时运行）
+  BUFFER_LIMITED=0
+  if awk "BEGIN{exit !($BASELINE_THROUGHPUT > 5)}"; then
+    run_diagnostic_buffer_test "$target" "$direction" "$duration"
+  fi
+
+  # BDP 估算（用于缓冲候选）
+  local bdp=0
+  if awk "BEGIN{exit !($idle_rtt > 0 && $BASELINE_THROUGHPUT > 0)}"; then
+    bdp="$(awk "BEGIN{printf \"%.0f\", $BASELINE_THROUGHPUT * 1000000 * $idle_rtt / 1000 / 8}")"
+  fi
+  [ "$bdp" -lt "$MIN_WINDOW" ] && bdp="$MIN_WINDOW"
+
+  # 可用内存约束（25% MemAvailable）
+  local mem_avail_kb
+  mem_avail_kb="$(awk '/MemAvailable/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 1048576)"
+  local mem_budget_bytes=$(( mem_avail_kb * 1024 / 4 ))
+
+  # 生成候选
+  declare -a CAND_CC CAND_QDISC CAND_WMEM CAND_RMEM CAND_LABEL
+  local cand_count=0
+
+  # 1) CC 候选（逐一替换，qdisc 保持当前）
+  for _cc in bbr cubic reno; do
+    [ "$cand_count" -ge "$AT_MAX_CANDIDATES" ] && break
+    [[ " $available_cc " == *" $_cc "* ]] || continue
+    [ "$_cc" = "$current_cc" ] && continue
+    CAND_CC[$cand_count]="$_cc"
+    CAND_QDISC[$cand_count]="$current_qdisc"
+    CAND_WMEM[$cand_count]=""
+    CAND_RMEM[$cand_count]=""
+    CAND_LABEL[$cand_count]="CC=$_cc"
+    cand_count=$((cand_count + 1))
+  done
+
+  # 2) qdisc=fq 候选（CC 保持当前）
+  if [ "$current_qdisc" != "fq" ] && [ "$cand_count" -lt "$AT_MAX_CANDIDATES" ]; then
+    CAND_CC[$cand_count]="$current_cc"
+    CAND_QDISC[$cand_count]="fq"
+    CAND_WMEM[$cand_count]=""
+    CAND_RMEM[$cand_count]=""
+    CAND_LABEL[$cand_count]="qdisc=fq"
+    cand_count=$((cand_count + 1))
+  fi
+
+  # 3) BBR+fq 组合（若两者均非当前值）
+  if [ "$current_cc" != "bbr" ] && [ "$current_qdisc" != "fq" ] && \
+     [[ " $available_cc " == *" bbr "* ]] && [ "$cand_count" -lt "$AT_MAX_CANDIDATES" ]; then
+    CAND_CC[$cand_count]="bbr"
+    CAND_QDISC[$cand_count]="fq"
+    CAND_WMEM[$cand_count]=""
+    CAND_RMEM[$cand_count]=""
+    CAND_LABEL[$cand_count]="CC=bbr+qdisc=fq"
+    cand_count=$((cand_count + 1))
+  fi
+
+  # 4) 缓冲候选（仅在诊断确认缓冲瓶颈时）
+  if [ "$BUFFER_LIMITED" -eq 1 ] && [ "$bdp" -gt 0 ]; then
+    local _cur_wmax
+    _cur_wmax="$(sysctl_value net.ipv4.tcp_wmem | awk '{print $3}')"
+    for _factor in 1.5 2 4; do
+      [ "$cand_count" -ge "$AT_MAX_CANDIDATES" ] && break
+      local _new_max
+      _new_max="$(awk "BEGIN{printf \"%.0f\", $bdp * $_factor}")"
+      [ "$_new_max" -gt "$mem_budget_bytes" ] && _new_max="$mem_budget_bytes"
+      # 只在新值大于当前值时生成候选
+      awk "BEGIN{exit !($_new_max > ${_cur_wmax:-0})}" || continue
+      CAND_CC[$cand_count]="$current_cc"
+      CAND_QDISC[$cand_count]="$current_qdisc"
+      CAND_WMEM[$cand_count]="$_new_max"
+      CAND_RMEM[$cand_count]="$_new_max"
+      CAND_LABEL[$cand_count]="wmem/rmem_max=${_new_max}(BDP×${_factor})"
+      cand_count=$((cand_count + 1))
+    done
+  fi
+
+  printf '生成候选数：%s\n' "$cand_count"
+  session_log "candidates=$cand_count buffer_limited=$BUFFER_LIMITED bdp=$bdp"
+
+  if [ "$cand_count" -eq 0 ]; then
+    green "未生成任何候选（当前配置已是可用选项中最优），无需变更。"
+    [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
+    _at_cleanup success; trap - INT TERM EXIT; pause; return
+  fi
+
+  # 基线得分
+  local baseline_score
+  score_candidate "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" \
+    "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"
+  baseline_score="${CANDIDATE_SCORE:-0}"
+
+  # 候选筛选
+  declare -a RES_SCORE RES_TP RES_RETR RES_RTT RES_STATUS
+  local best_idx=-1 best_score_val="-1"
+
+  echo
+  green "--- 候选筛选（预算 60% = $(( screen_budget / 1024 / 1024 )) MiB）---"
+  local i
+  for (( i=0; i<cand_count; i++ )); do
+    if [ "$BUDGET_USED_BYTES" -gt "$screen_budget" ]; then
+      yellow "筛选预算已用完，跳过剩余候选。"
       break
     fi
-    collect_test_result "$candidate" "$command"
-    if [ "$RESULT_SHAKE" = "no" ] && [ "$RESULT_RETR" -lt 100 ]; then
-      last_good="$candidate"
-      green "本轮属于低重传且无明显抖动，可作为已验证候选。"
-      echo "1. 上调窗口继续探索"
-      echo "2. 基于本轮结果进入稳定余量验证"
-      echo "0. 结束而不保存"
-      read -rp "请选择 [0-2]: " choice
-      case "$choice" in
-        1)
-          if [ "$RESULT_RETR" -le 9 ]; then
-            read_positive "上调多少 MiB" "2"
-          else
-            read_positive "上调多少 MiB" "0.5"
-          fi
-          next_step="$(awk "BEGIN{printf \"%.0f\", $REPLY * $MIB}")"
-          candidate=$((last_good + next_step))
-          ;;
-        2)
-          read_nonnegative "为晚高峰稳定性回退多少 MiB（文章建议 0.5 或 1）" "1"
-          margin="$(awk "BEGIN{printf \"%.0f\", $REPLY * $MIB}")"
-          final_candidate=$((last_good - margin))
-          [ "$final_candidate" -lt "$MIN_WINDOW" ] && final_candidate="$MIN_WINDOW"
-          candidate="$final_candidate"
-          yellow "稳定余量值也必须完成一轮测试后才可写入配置。"
-          if apply_window "$candidate"; then
-            collect_test_result "$candidate" "$command"
-            if [ "$RESULT_SHAKE" = "no" ] && [ "$RESULT_RETR" -lt 100 ]; then
-              green "最终候选已通过测试：$candidate Byte"
-              read -rp "是否写入 $CONF 并应用？[y/N]: " applied
-              if [[ "$applied" =~ ^[Yy]$ ]]; then
-                persist_final "$candidate" && green "已保存并应用最终配置。" ||
-                  red "写入或应用配置失败。"
-              fi
-              break
-            fi
-            yellow "稳定余量值未通过验证，请继续降低候选值后测试。"
-          fi
-          ;;
-        *) break ;;
-      esac
-    else
-      yellow "本轮重传较高或存在抖动/断流，应降低缓冲区后重测。"
-      read_positive "下调多少 MiB" "1"
-      next_step="$(awk "BEGIN{printf \"%.0f\", $REPLY * $MIB}")"
-      candidate=$((candidate - next_step))
-      [ "$candidate" -lt "$MIN_WINDOW" ] && candidate="$MIN_WINDOW"
+
+    yellow "候选 $((i+1))/$cand_count：${CAND_LABEL[$i]}"
+
+    # 应用候选
+    apply_cc "${CAND_CC[$i]}"
+    apply_qdisc "${CAND_QDISC[$i]}"
+    [ -n "${CAND_WMEM[$i]}" ] && apply_wmem "${CAND_WMEM[$i]}"
+    [ -n "${CAND_RMEM[$i]}" ] && apply_rmem "${CAND_RMEM[$i]}"
+
+    if ! run_iperf3_json "$target" "$direction" "$duration" 1; then
+      red "  测试失败，跳过此候选。"
+      RES_STATUS[$i]="fail"; RES_SCORE[$i]=-1
+      session_restore_runtime; continue
     fi
+
+    RES_TP[$i]="$IPERF_THROUGHPUT"
+    RES_RETR[$i]="$IPERF_RETR"
+    RES_RTT[$i]="$IPERF_RTT"
+
+    if score_candidate "${RES_TP[$i]}" "${RES_RETR[$i]}" "${RES_RTT[$i]}" \
+        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+      RES_SCORE[$i]="$CANDIDATE_SCORE"
+      RES_STATUS[$i]="pass"
+      printf '  吞吐: %s Mbps，Retr: %s，RTT: %s us，得分: %s\n' \
+        "${RES_TP[$i]}" "${RES_RETR[$i]}" "${RES_RTT[$i]}" "$CANDIDATE_SCORE"
+      # 超过当前最佳 5% 才替换（防止微小差异导致不必要变更）
+      if awk "BEGIN{exit !(${CANDIDATE_SCORE} > ${best_score_val} * 1.05 || $best_idx == -1)}"; then
+        best_score_val="$CANDIDATE_SCORE"
+        best_idx="$i"
+      fi
+    else
+      RES_SCORE[$i]=-1
+      RES_STATUS[$i]="reject"
+      printf '  拒绝：%s\n' "$SCORE_REJECT_REASON"
+    fi
+    # 记录到 TSV
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${CAND_LABEL[$i]}" "${RES_TP[$i]:-0}" "${RES_RETR[$i]:-0}" \
+      "${RES_RTT[$i]:-0}" "${RES_SCORE[$i]:-−1}" "${RES_STATUS[$i]:-fail}" \
+      >> "$SESSION_DIR/results.tsv"
+    # 恢复到快照状态后测下一个候选
+    session_restore_runtime
   done
+
+  if [ "$best_idx" -eq -1 ]; then
+    yellow "所有候选均未通过筛选，保留当前配置。"
+    [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
+    _at_cleanup success_no_change; trap - INT TERM EXIT; pause; return
+  fi
+
+  green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
+  session_log "best_candidate=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
+
+  # 最终验收测试（40% 预算，-P 4 并发，时长 2× duration）
   echo
-  printf '测试记录保存在：%s\n' "$SESSION_LOG"
-  [ -n "$last_good" ] && printf '最后一次通过测试的候选值：%s Byte\n' "$last_good"
+  green "--- 最终验收测试（-P 4 并发，时长 $((duration * 2)) 秒）---"
+  apply_cc "${CAND_CC[$best_idx]}"
+  apply_qdisc "${CAND_QDISC[$best_idx]}"
+  [ -n "${CAND_WMEM[$best_idx]}" ] && apply_wmem "${CAND_WMEM[$best_idx]}"
+  [ -n "${CAND_RMEM[$best_idx]}" ] && apply_rmem "${CAND_RMEM[$best_idx]}"
+
+  local final_ok=0
+  if run_iperf3_json "$target" "$direction" "$((duration * 2))" 4; then
+    if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
+        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+      green "验收通过：吞吐 $IPERF_THROUGHPUT Mbps，Retr=$IPERF_RETR，RTT=${IPERF_RTT}us，得分=$CANDIDATE_SCORE"
+      final_ok=1
+    else
+      red "验收未通过评分：$SCORE_REJECT_REASON"
+    fi
+  else
+    red "验收测试执行失败。"
+  fi
+  session_log "acceptance ok=$final_ok tp=${IPERF_THROUGHPUT:-0} retr=${IPERF_RETR:-0}"
+
+  [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
+
+  if [ "$final_ok" -eq 0 ]; then
+    yellow "恢复到调优前状态。"
+    session_restore_runtime
+    _at_cleanup failed_acceptance; trap - INT TERM EXIT; pause; return
+  fi
+
+  # 原子持久化
+  if persist_final_atomic "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
+      "${CAND_WMEM[$best_idx]}" "${CAND_RMEM[$best_idx]}"; then
+    # 持久化成功，删除 watchdog 恢复脚本
+    rm -f "$SESSION_DIR/restore.sh"
+    session_log "persisted=yes"
+
+    echo
+    green "=== 调优前后对比 ==="
+    local snap_cc snap_qdisc snap_wmem snap_rmem
+    snap_cc="$(awk '/tcp_congestion_control/{print $NF}' "$SESSION_DIR/snapshot.conf")"
+    snap_qdisc="$(awk '/default_qdisc/{print $NF}' "$SESSION_DIR/snapshot.conf")"
+    snap_wmem="$(awk '/tcp_wmem/{$1=$2=""; print $0}' "$SESSION_DIR/snapshot.conf" | xargs)"
+    snap_rmem="$(awk '/tcp_rmem/{$1=$2=""; print $0}' "$SESSION_DIR/snapshot.conf" | xargs)"
+    printf '%-35s %s → %s\n' "tcp_congestion_control:" "$snap_cc" "${CAND_CC[$best_idx]}"
+    printf '%-35s %s → %s\n' "default_qdisc:"          "$snap_qdisc" "${CAND_QDISC[$best_idx]}"
+    [ -n "${CAND_WMEM[$best_idx]}" ] && printf '%-35s %s → 4096 16384 %s\n' "tcp_wmem:" "$snap_wmem" "${CAND_WMEM[$best_idx]}"
+    [ -n "${CAND_RMEM[$best_idx]}" ] && printf '%-35s %s → 4096 87380 %s\n' "tcp_rmem:" "$snap_rmem" "${CAND_RMEM[$best_idx]}"
+    printf '%-35s %s Mbps → %s Mbps\n' "吞吐量:" "$BASELINE_THROUGHPUT" "$IPERF_THROUGHPUT"
+    echo
+    yellow "如需回滚，执行：bash $SESSION_DIR/restore.sh"
+    printf '会话日志：%s/session.log\n' "$SESSION_DIR"
+    printf '测试记录：%s/results.tsv\n' "$SESSION_DIR"
+    proxy_acceptance_test
+    _at_cleanup success; trap - INT TERM EXIT
+  else
+    red "持久化失败，已自动恢复。"
+    session_restore_runtime
+    _at_cleanup failed_persist; trap - INT TERM EXIT
+  fi
   pause
 }
+
 
 valid_target_host(){
   [[ "$1" =~ ^[a-zA-Z0-9._:-]+$ ]]
@@ -1944,135 +2416,364 @@ run_remote_round(){
   ROUND_OK="$round_ok"
 }
 
-remote_tune_flow(){
-  local target duration vps_bw bottleneck bdp candidate mib_value primary
-  local index choice step last_good="" margin final_candidate yn
-  clear_screen
-  green "远程节点自动调优：VPS -> 测试节点下载方向"
-  echo "说明：被调 VPS 作为控制端和发送端，通过 SSH 登录远程测试节点。"
-  echo "默认推荐密钥认证；密码模式需 sshpass，密码仅在本次运行期间驻留内存。"
-  echo
-  if [ -f "$MYSTERY_CONF" ]; then
-    red "检测到已启用的迷之调参持久化配置：$MYSTERY_CONF"
-    yellow "请先执行初始化恢复移除迷之调参配置，再使用远程实测调优流程。"
-    pause
-    return
+
+##############################################################################
+# 远程节点自动调优（替代旧 remote_tune_flow）
+##############################################################################
+
+_rat_cleanup(){
+  local reason="${1:-}"
+  trap - INT TERM EXIT
+  watchdog_stop
+  if [ "$reason" != "success" ] && [ -n "$SESSION_DIR" ] && [ -f "$SESSION_DIR/snapshot.conf" ]; then
+    session_restore_runtime
   fi
+  clear_remote_credentials
+  lock_release
+  [ -n "$SESSION_DIR" ] && session_log "remote_cleanup reason=$reason"
+}
+
+remote_auto_tune_flow(){
+  local target direction duration vps_bw
+  clear_screen
+  green "远程节点自动调优（双方向 + 并发）"
+  echo "说明：通过 SSH 登录远程测试节点，自动采集吞吐、重传、RTT 数据并选出最佳配置。"
+  echo
+
   require_root || { pause; return; }
+  if [ -f "$MYSTERY_CONF" ]; then
+    red "检测到已启用的迷之调参持久化配置，请先初始化恢复后再使用远程调优。"
+    pause; return
+  fi
   check_remote_local_env || { red "远程模式本机依赖未满足。"; pause; return; }
+
+  lock_acquire || { pause; return; }
+  session_create || { lock_release; red "无法创建会话快照，取消调优。"; pause; return; }
+
+  trap '_rat_cleanup interrupted' INT TERM
+  trap '_rat_cleanup exit'        EXIT
+
+  watchdog_start "$SESSION_DIR/restore.sh"
+
+  BUDGET_USED_BYTES=0
+  local budget_bytes
+  budget_bytes=$(( AT_BUDGET_GIB * 1024 * 1024 * 1024 ))
+  local screen_budget=$(( budget_bytes * 60 / 100 ))
+
+  check_actual_qdisc
+
   while true; do
     read -rp "输入本 VPS 供测试节点访问的公网 IP/域名: " target
-    valid_target_host "$target" && break
+    valid_target_host "$target" && [ -n "$target" ] && break
     red "地址格式不合法。"
   done
-  read_positive_integer "输入每轮 iperf3 测试时长（秒）" "30"
+
+  echo "选择测试方向："
+  echo "1. VPS -> 测试节点（下载，VPS 发送）"
+  echo "2. 测试节点 -> VPS（上传，VPS 接收）"
+  while true; do
+    read -rp "请选择 [1-2]: " _choice
+    case "$_choice" in
+      1) direction="download"; break ;;
+      2) direction="upload"; break ;;
+      *) red "请选择 1 或 2。" ;;
+    esac
+  done
+
+  read_positive_integer "每轮 iperf3 测试时长（秒）" "$AT_DURATION"
   duration="$REPLY"
-  read_positive "输入本 VPS 发送方向有效带宽/端口上限 Mbps" ""
-  vps_bw="$REPLY"
+
   remote_add_nodes
-  remote_verify_nodes || { yellow "远程节点准备未通过，未进行参数测试。"; clear_remote_credentials; pause; return; }
+  remote_verify_nodes || {
+    yellow "远程节点准备未通过。"
+    _rat_cleanup failed_nodes; trap - INT TERM EXIT; pause; return
+  }
   remote_choose_bandwidth "$target" "$duration"
+
   NODE_RTT=()
-  remote_measure_rtt "$target" || { clear_remote_credentials; pause; return; }
+  remote_measure_rtt "$target" || {
+    _rat_cleanup failed_rtt; trap - INT TERM EXIT; pause; return
+  }
+
   echo
-  green "已添加测试节点"
-  for ((index=0; index<NODE_COUNT; index++)); do
-    printf '%s. %s - 有效带宽 %s Mbps, RTT %s ms\n' \
-      "$((index + 1))" "${NODE_LABEL[$index]}" "${NODE_BW[$index]}" "${NODE_RTT[$index]}"
+  green "测试节点列表"
+  for (( _i=0; _i<NODE_COUNT; _i++ )); do
+    printf '%s. %s  带宽=%s Mbps  RTT=%s ms\n' \
+      "$(( _i+1 ))" "${NODE_LABEL[$_i]}" "${NODE_BW[$_i]}" "${NODE_RTT[$_i]}"
   done
+
+  # 选主节点用于 BDP 估算
+  local primary=0
   while true; do
-    read_positive_integer "选择作为 BDP 初始计算基准的节点序号" "1"
-    primary=$((REPLY - 1))
+    read_positive_integer "选择用于 BDP 估算的主节点序号" "1"
+    primary=$(( REPLY - 1 ))
     [ "$primary" -ge 0 ] && [ "$primary" -lt "$NODE_COUNT" ] && break
-    red "节点序号超出范围。"
+    red "序号超出范围。"
   done
+
+  read_positive "输入本 VPS 在测试方向的有效带宽上限 Mbps" ""
+  vps_bw="$REPLY"
+
+  local bottleneck
   bottleneck="$(awk "BEGIN{print (${NODE_BW[$primary]} < $vps_bw) ? ${NODE_BW[$primary]} : $vps_bw}")"
-  bdp="$(awk "BEGIN{printf \"%.0f\", $bottleneck * 1000000 * (${NODE_RTT[$primary]} / 1000) / 8}")"
+
+  local idle_rtt="${NODE_RTT[$primary]}"
+  local bdp
+  bdp="$(awk "BEGIN{printf \"%.0f\", $bottleneck * 1000000 * $idle_rtt / 1000 / 8}")"
   [ "$bdp" -lt "$MIN_WINDOW" ] && bdp="$MIN_WINDOW"
-  mib_value="$(awk "BEGIN{printf \"%.2f\", $bdp / $MIB}")"
-  echo
-  green "BDP 起点"
-  printf '基准节点: %s\n基准节点有效带宽: %s Mbps\nVPS 发送上限: %s Mbps\n采用瓶颈带宽: %s Mbps\n基准节点 RTT: %s ms\n' \
-    "${NODE_LABEL[$primary]}" "${NODE_BW[$primary]}" "$vps_bw" "$bottleneck" "${NODE_RTT[$primary]}"
-  printf 'BDP = %s Byte（约 %s MiB）\n' "$bdp" "$mib_value"
-  yellow "多节点模式以全部节点均低重传为通过标准；自动化无法识别主观画面卡顿。"
-  echo "1. 使用 BDP 理论值作为初始候选"
-  echo "2. 手动输入初始最大缓冲区字节数"
-  echo "0. 取消"
-  read -rp "请选择 [0-2]: " choice
-  case "$choice" in
-    1) candidate="$bdp" ;;
-    2)
-      read_positive_integer "输入初始最大缓冲区 Byte" ""
-      candidate="$REPLY"
-      [ "$candidate" -lt "$MIN_WINDOW" ] && candidate="$MIN_WINDOW"
-      ;;
-    *) clear_remote_credentials; pause; return ;;
-  esac
-  save_baseline_once || { red "保存基线失败，取消调优。"; clear_remote_credentials; pause; return; }
-  prepare_bbr_fq || { clear_remote_credentials; pause; return; }
-  mkdir -p "$STATE_DIR" || { red "无法创建状态目录。"; clear_remote_credentials; pause; return; }
-  printf 'window_bytes\tnode\trtt_ms\tthroughput_mbps\tretr\n' > "$REMOTE_SESSION_LOG"
-  while true; do
-    mib_value="$(awk "BEGIN{printf \"%.2f\", $candidate / $MIB}")"
-    yellow "候选最大缓冲区：$candidate Byte（约 $mib_value MiB）"
-    read -rp "是否临时应用并自动测试全部远程节点？[Y/n/q]: " yn
-    [[ "$yn" =~ ^[Qq]$ ]] && break
-    [[ "$yn" =~ ^[Nn]$ ]] && continue
-    apply_window "$candidate" || { red "临时设置失败。"; break; }
-    run_remote_round "$target" "$duration" "$candidate"
-    if [ "$ROUND_OK" -eq 1 ]; then
-      last_good="$candidate"
-      green "全部节点 Retr < 100，本候选已通过自动判定。"
-      echo "1. 上调窗口继续探索"
-      echo "2. 回退余量并执行最终验证"
-      echo "0. 结束而不保存"
-      read -rp "请选择 [0-2]: " choice
-      case "$choice" in
-        1)
-          if [ "$ROUND_RETR" -le 9 ]; then
-            read_positive "上调多少 MiB" "2"
-          else
-            read_positive "上调多少 MiB" "0.5"
-          fi
-          step="$(awk "BEGIN{printf \"%.0f\", $REPLY * $MIB}")"
-          candidate=$((last_good + step))
-          ;;
-        2)
-          read_nonnegative "稳定性回退多少 MiB（文章建议 0.5 或 1）" "1"
-          margin="$(awk "BEGIN{printf \"%.0f\", $REPLY * $MIB}")"
-          final_candidate=$((last_good - margin))
-          [ "$final_candidate" -lt "$MIN_WINDOW" ] && final_candidate="$MIN_WINDOW"
-          apply_window "$final_candidate" || { red "临时设置失败。"; break; }
-          run_remote_round "$target" "$duration" "$final_candidate"
-          if [ "$ROUND_OK" -eq 1 ]; then
-            green "最终余量值已通过全部节点验证：$final_candidate Byte"
-            read -rp "是否写入 $CONF 并应用？[y/N]: " yn
-            [[ "$yn" =~ ^[Yy]$ ]] && {
-              persist_final "$final_candidate" && green "已保存并应用最终配置。" ||
-                red "写入或应用配置失败。"
-            }
-            break
-          fi
-          yellow "最终余量验证未通过，请继续降低候选值测试。"
-          candidate="$final_candidate"
-          ;;
-        *) break ;;
-      esac
+
+  printf '主节点: %s  RTT: %s ms  瓶颈带宽: %s Mbps  BDP: %s Byte\n' \
+    "${NODE_LABEL[$primary]}" "$idle_rtt" "$bottleneck" "$bdp"
+  session_log "remote target=$target direction=$direction primary=${NODE_LABEL[$primary]} bdp=$bdp"
+
+  # 当前 CC/qdisc
+  local current_cc current_qdisc available_cc
+  current_cc="$(sysctl_value net.ipv4.tcp_congestion_control)"
+  current_qdisc="$(sysctl_value net.core.default_qdisc)"
+  available_cc="$(sysctl_value net.ipv4.tcp_available_congestion_control)"
+
+  # 基线测试（通过主节点）
+  green "--- 基线测试（主节点 ${NODE_LABEL[$primary]}）---"
+  if ! _remote_run_one_test "$primary" "$target" "$direction" "$duration" 1; then
+    red "基线测试失败。"
+    _rat_cleanup failed_baseline; trap - INT TERM EXIT; pause; return
+  fi
+  BASELINE_THROUGHPUT="$IPERF_THROUGHPUT"
+  BASELINE_RETR="$IPERF_RETR"
+  BASELINE_RTT="$IPERF_RTT"
+  BASELINE_BYTES="$(awk "BEGIN{printf \"%.0f\", $BASELINE_THROUGHPUT * 1000000 / 8 * $duration + 1}")"
+  printf '基线：吞吐 %s Mbps，Retr=%s，RTT=%s us\n' \
+    "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT"
+  session_log "baseline tp=${BASELINE_THROUGHPUT}Mbps retr=$BASELINE_RETR"
+
+  # 诊断性缓冲测试（通过主节点，单流 vs 并发）
+  BUFFER_LIMITED=0
+  if awk "BEGIN{exit !($BASELINE_THROUGHPUT > 5)}"; then
+    green "诊断性缓冲测试..."
+    _remote_run_one_test "$primary" "$target" "$direction" "$duration" 1
+    local diag_single="$IPERF_THROUGHPUT"
+    _remote_run_one_test "$primary" "$target" "$direction" "$duration" 4
+    local diag_parallel="$IPERF_THROUGHPUT"
+    if awk "BEGIN{exit !($diag_single > 0 && $diag_parallel / ($diag_single + 0.001) > 1.3 && $diag_parallel > 10)}"; then
+      BUFFER_LIMITED=1
+      printf '诊断：并发 %.1f Mbps > 单流 %.1f Mbps，存在缓冲瓶颈\n' "$diag_parallel" "$diag_single"
     else
-      yellow "至少一个节点 Retr >= 100 或测试失败，应下调候选值重测。"
-      read_positive "下调多少 MiB" "1"
-      step="$(awk "BEGIN{printf \"%.0f\", $REPLY * $MIB}")"
-      candidate=$((candidate - step))
-      [ "$candidate" -lt "$MIN_WINDOW" ] && candidate="$MIN_WINDOW"
+      printf '诊断：无明显缓冲瓶颈证据\n'
+    fi
+  fi
+
+  # 可用内存约束（25% MemAvailable）
+  local mem_avail_kb
+  mem_avail_kb="$(awk '/MemAvailable/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 1048576)"
+  local mem_budget_bytes=$(( mem_avail_kb * 1024 / 4 ))
+
+  # 生成候选
+  declare -a CAND_CC CAND_QDISC CAND_WMEM CAND_RMEM CAND_LABEL
+  local cand_count=0
+
+  for _cc in bbr cubic reno; do
+    [ "$cand_count" -ge "$AT_MAX_CANDIDATES" ] && break
+    [[ " $available_cc " == *" $_cc "* ]] || continue
+    [ "$_cc" = "$current_cc" ] && continue
+    CAND_CC[$cand_count]="$_cc"; CAND_QDISC[$cand_count]="$current_qdisc"
+    CAND_WMEM[$cand_count]=""; CAND_RMEM[$cand_count]=""
+    CAND_LABEL[$cand_count]="CC=$_cc"; cand_count=$((cand_count + 1))
+  done
+
+  if [ "$current_qdisc" != "fq" ] && [ "$cand_count" -lt "$AT_MAX_CANDIDATES" ]; then
+    CAND_CC[$cand_count]="$current_cc"; CAND_QDISC[$cand_count]="fq"
+    CAND_WMEM[$cand_count]=""; CAND_RMEM[$cand_count]=""
+    CAND_LABEL[$cand_count]="qdisc=fq"; cand_count=$((cand_count + 1))
+  fi
+
+  if [ "$current_cc" != "bbr" ] && [ "$current_qdisc" != "fq" ] && \
+     [[ " $available_cc " == *" bbr "* ]] && [ "$cand_count" -lt "$AT_MAX_CANDIDATES" ]; then
+    CAND_CC[$cand_count]="bbr"; CAND_QDISC[$cand_count]="fq"
+    CAND_WMEM[$cand_count]=""; CAND_RMEM[$cand_count]=""
+    CAND_LABEL[$cand_count]="CC=bbr+qdisc=fq"; cand_count=$((cand_count + 1))
+  fi
+
+  if [ "$BUFFER_LIMITED" -eq 1 ] && [ "$bdp" -gt 0 ]; then
+    local _cur_wmax
+    _cur_wmax="$(sysctl_value net.ipv4.tcp_wmem | awk '{print $3}')"
+    for _factor in 1.5 2 4; do
+      [ "$cand_count" -ge "$AT_MAX_CANDIDATES" ] && break
+      local _new_max
+      _new_max="$(awk "BEGIN{printf \"%.0f\", $bdp * $_factor}")"
+      [ "$_new_max" -gt "$mem_budget_bytes" ] && _new_max="$mem_budget_bytes"
+      awk "BEGIN{exit !($_new_max > ${_cur_wmax:-0})}" || continue
+      CAND_CC[$cand_count]="$current_cc"; CAND_QDISC[$cand_count]="$current_qdisc"
+      CAND_WMEM[$cand_count]="$_new_max"; CAND_RMEM[$cand_count]="$_new_max"
+      CAND_LABEL[$cand_count]="wmem/rmem_max=${_new_max}(BDP×${_factor})"
+      cand_count=$((cand_count + 1))
+    done
+  fi
+
+  printf '生成候选数：%s\n' "$cand_count"
+  if [ "$cand_count" -eq 0 ]; then
+    green "未生成任何候选，保留当前配置。"
+    clear_remote_credentials
+    _rat_cleanup success_no_change; trap - INT TERM EXIT; pause; return
+  fi
+
+  # 候选筛选（所有节点通过才算通过）
+  declare -a RES_SCORE RES_TP RES_RETR RES_RTT RES_STATUS
+  local best_idx=-1 best_score_val="-1"
+
+  echo
+  green "--- 候选筛选（$NODE_COUNT 个节点，预算 60%）---"
+  for (( i=0; i<cand_count; i++ )); do
+    [ "$BUDGET_USED_BYTES" -gt "$screen_budget" ] && { yellow "预算已用完。"; break; }
+    yellow "候选 $((i+1))/$cand_count：${CAND_LABEL[$i]}"
+    apply_cc "${CAND_CC[$i]}"
+    apply_qdisc "${CAND_QDISC[$i]}"
+    [ -n "${CAND_WMEM[$i]}" ] && apply_wmem "${CAND_WMEM[$i]}"
+    [ -n "${CAND_RMEM[$i]}" ] && apply_rmem "${CAND_RMEM[$i]}"
+
+    # 测试所有节点，取最差得分
+    local round_ok=1 worst_score="9999999" sum_tp=0 sum_retr=0 worst_rtt=0
+    for (( _ni=0; _ni<NODE_COUNT; _ni++ )); do
+      if ! _remote_run_one_test "$_ni" "$target" "$direction" "$duration" 1; then
+        red "  节点 ${NODE_LABEL[$_ni]} 测试失败。"
+        round_ok=0; continue
+      fi
+      printf '  节点 %s: 吞吐 %s Mbps，Retr=%s，RTT=%s us\n' \
+        "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT"
+      if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
+          "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+        awk "BEGIN{exit !($CANDIDATE_SCORE < $worst_score)}" && worst_score="$CANDIDATE_SCORE"
+      else
+        printf '  节点 %s 拒绝：%s\n' "${NODE_LABEL[$_ni]}" "$SCORE_REJECT_REASON"
+        round_ok=0
+      fi
+    done
+
+    if [ "$round_ok" -eq 1 ] && awk "BEGIN{exit !($worst_score > $best_score_val * 1.05 || $best_idx == -1)}"; then
+      RES_SCORE[$i]="$worst_score"
+      RES_STATUS[$i]="pass"
+      best_score_val="$worst_score"
+      best_idx="$i"
+      printf '  候选通过，最低得分: %s\n' "$worst_score"
+    else
+      RES_SCORE[$i]=-1
+      RES_STATUS[$i]="$([ "$round_ok" -eq 0 ] && echo fail || echo reject)"
+      printf '  候选未通过（round_ok=%s worst_score=%s）\n' "$round_ok" "$worst_score"
+    fi
+    printf '%s\t%s\t%s\n' "${CAND_LABEL[$i]}" "${RES_SCORE[$i]}" "${RES_STATUS[$i]}" \
+      >> "$SESSION_DIR/results.tsv"
+    session_restore_runtime
+  done
+
+  if [ "$best_idx" -eq -1 ]; then
+    yellow "所有候选均未通过，保留当前配置。"
+    clear_remote_credentials
+    _rat_cleanup success_no_change; trap - INT TERM EXIT; pause; return
+  fi
+
+  green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
+  session_log "best=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
+
+  # 最终验收（所有节点，-P 4，时长 2×）
+  echo
+  green "--- 最终验收测试（所有 $NODE_COUNT 节点，-P 4，时长 $((duration * 2)) 秒）---"
+  apply_cc "${CAND_CC[$best_idx]}"
+  apply_qdisc "${CAND_QDISC[$best_idx]}"
+  [ -n "${CAND_WMEM[$best_idx]}" ] && apply_wmem "${CAND_WMEM[$best_idx]}"
+  [ -n "${CAND_RMEM[$best_idx]}" ] && apply_rmem "${CAND_RMEM[$best_idx]}"
+
+  local final_ok=1
+  for (( _ni=0; _ni<NODE_COUNT; _ni++ )); do
+    if ! _remote_run_one_test "$_ni" "$target" "$direction" "$((duration * 2))" 4; then
+      red "节点 ${NODE_LABEL[$_ni]} 验收测试失败。"
+      final_ok=0; continue
+    fi
+    if ! score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
+        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+      red "节点 ${NODE_LABEL[$_ni]} 验收未通过：$SCORE_REJECT_REASON"
+      final_ok=0
+    else
+      printf '节点 %s 验收通过：%s Mbps，得分 %s\n' "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "$CANDIDATE_SCORE"
     fi
   done
-  echo
-  printf '远程测试记录保存在：%s\n' "$REMOTE_SESSION_LOG"
-  [ -n "$last_good" ] && printf '最后一次通过全部节点的候选值：%s Byte\n' "$last_good"
+  session_log "acceptance ok=$final_ok"
+
+  if [ "$final_ok" -eq 0 ]; then
+    yellow "验收未通过，恢复到调优前状态。"
+    session_restore_runtime
+    clear_remote_credentials
+    _rat_cleanup failed_acceptance; trap - INT TERM EXIT; pause; return
+  fi
+
   clear_remote_credentials
+
+  if persist_final_atomic "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
+      "${CAND_WMEM[$best_idx]}" "${CAND_RMEM[$best_idx]}"; then
+    rm -f "$SESSION_DIR/restore.sh"
+    session_log "persisted=yes"
+    echo
+    green "=== 调优前后对比 ==="
+    printf '%-35s %s → %s\n' "tcp_congestion_control:" \
+      "$(awk '/tcp_congestion_control/{print $NF}' "$SESSION_DIR/snapshot.conf")" \
+      "${CAND_CC[$best_idx]}"
+    printf '%-35s %s → %s\n' "default_qdisc:" \
+      "$(awk '/default_qdisc/{print $NF}' "$SESSION_DIR/snapshot.conf")" \
+      "${CAND_QDISC[$best_idx]}"
+    yellow "如需回滚：bash $SESSION_DIR/restore.sh"
+    proxy_acceptance_test
+    _rat_cleanup success; trap - INT TERM EXIT
+  else
+    red "持久化失败，已自动恢复。"
+    session_restore_runtime
+    _rat_cleanup failed_persist; trap - INT TERM EXIT
+  fi
   pause
 }
+
+# 单节点单次测试（支持方向和并发）
+_remote_run_one_test(){
+  local index="$1" target="$2" direction="${3:-download}" duration="${4:-20}" parallel="${5:-1}"
+  local json bps retr rtt bytes server_log server_pid ssh_status ssh_error
+  server_log="$(mktemp)"
+  ssh_error="$(mktemp)"
+
+  local iperf_args=("-c" "$target" "-J" "-t" "$duration")
+  [ "$direction" = "download" ] && iperf_args+=("-R")
+  [ "$parallel" -gt 1 ] && iperf_args+=("-P" "$parallel")
+  local iperf_cmd="iperf3 ${iperf_args[*]}"
+
+  iperf3 -s -1 >"$server_log" 2>&1 &
+  server_pid=$!
+  sleep 1
+
+  json="$(ssh_node "$index" "$iperf_cmd" 2>"$ssh_error")"
+  ssh_status=$?
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+
+  if [ "$ssh_status" -ne 0 ] || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    [ -s "$ssh_error" ] && { yellow "SSH/远程错误："; cat "$ssh_error"; }
+    rm -f "$server_log" "$ssh_error"
+    IPERF_THROUGHPUT=0; IPERF_RETR=0; IPERF_RTT=0; IPERF_BYTES=0
+    return 1
+  fi
+  rm -f "$server_log" "$ssh_error"
+
+  bps="$(printf '%s' "$json" | jq -r '.end.sum_received.bits_per_second // .end.sum.bits_per_second // 0')"
+  retr="$(printf '%s' "$json" | jq -r '(.server_output_json.end.sum_sent.retransmits // .end.sum_sent.retransmits // 0)')"
+  rtt="$(printf '%s' "$json" | jq -r '[.end.streams[]?.sender.mean_rtt // empty] | if length>0 then (add/length) else 0 end' 2>/dev/null || echo 0)"
+  bytes="$(printf '%s' "$json" | jq -r '.end.sum_received.bytes // .end.sum.bytes // 0')"
+
+  IPERF_THROUGHPUT="$(awk "BEGIN{printf \"%.2f\", ${bps:-0} / 1000000}")"
+  IPERF_RETR="${retr:-0}"
+  IPERF_RTT="$(awk "BEGIN{printf \"%.0f\", ${rtt:-0}}")"
+  IPERF_BYTES="${bytes:-0}"
+  _at_budget_add "${bytes:-0}"
+  printf '%s %s %s\t%s Mbps\tRetr=%s\tRTT=%sus\n' \
+    "${CAND_LABEL[$i]:-baseline}" "${NODE_LABEL[$index]}" \
+    "$direction" "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" >> "$SESSION_DIR/results.tsv"
+  return 0
+}
+
 
 start_iperf_server(){
   clear_screen
@@ -2100,9 +2801,9 @@ menu(){
     echo "5. 启动 iperf3 服务端（手工模式使用）"
     echo
     green "[ 调试区 ]"
-    echo "6. 手工客户端：BDP 与 iperf3 交互调优"
-    echo "7. SSH 远程节点：下载方向自动测试调优"
-    echo "8. TCP 迷之调参 / 查看最近运行日志"
+    echo "6. 本地/远程节点：自动调优（自动选参 + 持久化）"
+    echo "7. SSH 远程多节点：自动调优（双向 + 并发）"
+    echo "8. TCP 迷之调参（已废弃，仅保留供参考）"
     echo
     green "[ 恢复 / 退出 ]"
     echo "9. 仅恢复调优前基线配置"
@@ -2116,8 +2817,8 @@ menu(){
       3) install_xanmod_kernel ;;
       4) public_speedtest_menu ;;
       5) start_iperf_server ;;
-      6) tune_flow ;;
-      7) remote_tune_flow ;;
+      6) auto_tune_flow ;;
+      7) remote_auto_tune_flow ;;
       8) mystery_tune_menu ;;
       9) restore_baseline ;;
       10) reset_to_initial_state ;;
@@ -2127,4 +2828,81 @@ menu(){
   done
 }
 
+##############################################################################
+# 可选 SOCKS5 代理验收测试
+##############################################################################
+# 通过设置以下环境变量启用：
+#   PROXY_HOST=<socks5 代理地址>
+#   PROXY_PORT=<端口，默认 1080>
+#   PROXY_TEST_URL=<受控测试目标 URL>
+
+proxy_acceptance_test(){
+  local proxy_host="${PROXY_HOST:-}" proxy_port="${PROXY_PORT:-1080}"
+  local test_url="${PROXY_TEST_URL:-}"
+  if [ -z "$proxy_host" ] || [ -z "$test_url" ]; then
+    return 0
+  fi
+  if ! has curl; then
+    yellow "未找到 curl，跳过代理验收测试。"
+    return 0
+  fi
+  green "--- 可选：SOCKS5 代理验收测试 ---"
+  printf '代理: socks5://%s:%s\n目标: %s\n' "$proxy_host" "$proxy_port" "$test_url"
+  local tmpfile elapsed bytes_dl throughput_mbps http_code
+  tmpfile="$(mktemp)"
+  local start_ts end_ts
+  start_ts="$(date +%s)"
+  http_code="$(curl -s --max-time 30 --socks5 "${proxy_host}:${proxy_port}" \
+       -o "$tmpfile" -w "%{http_code}" "$test_url" 2>/dev/null)"
+  end_ts="$(date +%s)"
+  elapsed=$(( end_ts - start_ts + 1 ))
+  bytes_dl="$(wc -c < "$tmpfile")"
+  throughput_mbps="$(awk "BEGIN{printf \"%.2f\", $bytes_dl * 8 / $elapsed / 1000000}")"
+  printf 'HTTP 状态: %s，下载 %s 字节，耗时 %ss，吞吐约 %s Mbps\n' \
+    "$http_code" "$bytes_dl" "$elapsed" "$throughput_mbps"
+  if [ "$http_code" = "200" ] && [ "${bytes_dl:-0}" -gt 0 ]; then
+    green "代理验收测试通过。"
+  else
+    yellow "代理验收测试：HTTP $http_code，请手动核查代理是否正常工作。"
+  fi
+  rm -f "$tmpfile"
+  [ -n "$SESSION_DIR" ] && session_log "proxy_test host=${proxy_host} port=${proxy_port} url=${test_url} http=${http_code}"
+}
+
+##############################################################################
+# CLI 参数解析
+##############################################################################
+
+_parse_cli_args(){
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max-candidates)
+        AT_MAX_CANDIDATES="${2:?--max-candidates 需要整数参数}"
+        shift 2 ;;
+      --duration)
+        AT_DURATION="${2:?--duration 需要整数参数}"
+        shift 2 ;;
+      --budget-gib)
+        AT_BUDGET_GIB="${2:?--budget-gib 需要整数参数}"
+        shift 2 ;;
+      --auto-tune)
+        auto_tune_flow
+        exit $? ;;
+      --help|-h)
+        printf 'tcptune %s\n使用方法: bash tcptune.sh [选项]\n\n选项:\n' "$SCRIPT_VERSION"
+        printf '  --max-candidates N   最大候选数（默认 %s）\n' "$AT_MAX_CANDIDATES"
+        printf '  --duration N         每轮测试时长秒（默认 %s）\n' "$AT_DURATION"
+        printf '  --budget-gib N       总流量预算 GiB（默认 %s）\n' "$AT_BUDGET_GIB"
+        printf '  --auto-tune          直接运行自动调优（非交互式）\n'
+        printf '\n代理验收（环境变量）:\n'
+        printf '  PROXY_HOST=<ip>      SOCKS5 代理 IP\n'
+        printf '  PROXY_PORT=<port>    SOCKS5 端口（默认 1080）\n'
+        printf '  PROXY_TEST_URL=<url> 验收目标 URL\n'
+        exit 0 ;;
+      *) shift ;;
+    esac
+  done
+}
+
+_parse_cli_args "$@"
 menu
