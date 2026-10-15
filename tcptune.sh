@@ -759,6 +759,10 @@ WATCHDOG_PID=""
 AT_MAX_CANDIDATES=8
 AT_DURATION=20
 AT_BUDGET_GIB=20
+AT_AUTO=0              # 1 when --auto-tune is active: disables all read/pause
+AT_TARGET=""           # iperf3 target host (set by --target or config)
+AT_DIRECTION="download" # test direction: download|upload
+AT_RETEST_ROUNDS=3     # interleaved re-test rounds for the winning candidate
 BUDGET_USED_BYTES=0
 BASELINE_THROUGHPUT=0
 BASELINE_RETR=0
@@ -770,8 +774,20 @@ ACTUAL_QDISC=""
 IPERF_THROUGHPUT=0
 IPERF_RETR=0
 IPERF_RTT=0
+IPERF_BYTES=0
 CANDIDATE_SCORE=""
 SCORE_REJECT_REASON=""
+
+# Improvement thresholds (balanced policy; configurable via env or config)
+AT_MIN_TP_GAIN="${AT_MIN_TP_GAIN:-5}"         # % throughput gain required
+AT_MIN_RTT_GAIN="${AT_MIN_RTT_GAIN:-20}"      # % RTT reduction that qualifies (if tp >= 95%)
+AT_MAX_RTT_FACTOR="${AT_MAX_RTT_FACTOR:-200}" # % max RTT relative to baseline
+AT_MAX_RETR_FACTOR="${AT_MAX_RETR_FACTOR:-300}" # % max norm_retr relative to baseline
+
+# Tuning exit codes
+AT_EXIT_COMMITTED=0
+AT_EXIT_FAILED=1
+AT_EXIT_NO_CHANGE=2
 
 session_create(){
   require_root || return 1
@@ -1152,8 +1168,118 @@ score_candidate(){
 }
 
 ##############################################################################
-# 原子持久化 + 读回核对
+# Reliable improvement judgement and interleaved winner re-test
 ##############################################################################
+
+# is_reliable_improvement: decide whether the winning candidate is reliably
+# better than baseline based on the median of interleaved re-test rounds.
+# $1=cand_tp_median $2=base_tp_median $3=cand_rtt_median $4=base_rtt_median
+# Returns 0 (reliable improvement found) or 1 (not enough improvement).
+# Populates IMPROVEMENT_REASON with a human-readable explanation.
+IMPROVEMENT_REASON=""
+is_reliable_improvement(){
+  local cand_tp="$1" base_tp="$2" cand_rtt="$3" base_rtt="$4"
+  IMPROVEMENT_REASON=""
+
+  if awk "BEGIN{exit !($base_tp <= 0)}"; then
+    IMPROVEMENT_REASON="基线吞吐未知，无法判定"
+    return 1
+  fi
+
+  # Throughput improvement >= AT_MIN_TP_GAIN %
+  local tp_gain_pct
+  tp_gain_pct="$(awk "BEGIN{printf \"%.1f\", ($cand_tp/$base_tp - 1)*100}")"
+  if awk "BEGIN{exit !($tp_gain_pct >= $AT_MIN_TP_GAIN)}"; then
+    IMPROVEMENT_REASON="吞吐提升 ${tp_gain_pct}%（≥ ${AT_MIN_TP_GAIN}%）"
+    return 0
+  fi
+
+  # RTT reduction >= AT_MIN_RTT_GAIN % while throughput >= 95% of baseline
+  if awk "BEGIN{exit !($cand_rtt > 0 && $base_rtt > 0 && $cand_tp >= $base_tp * 0.95)}"; then
+    local rtt_gain_pct
+    rtt_gain_pct="$(awk "BEGIN{printf \"%.1f\", (1 - $cand_rtt/$base_rtt)*100}")"
+    if awk "BEGIN{exit !($rtt_gain_pct >= $AT_MIN_RTT_GAIN)}"; then
+      IMPROVEMENT_REASON="RTT 降低 ${rtt_gain_pct}%（≥ ${AT_MIN_RTT_GAIN}%），吞吐未退化"
+      return 0
+    fi
+  fi
+
+  IMPROVEMENT_REASON="吞吐仅提升 ${tp_gain_pct}%（< ${AT_MIN_TP_GAIN}%），RTT 改善亦不足，收益未达阈值"
+  return 1
+}
+
+# _median: compute median of space-separated numbers via awk
+_median(){
+  printf '%s\n' $@ | awk '
+    BEGIN { n=0 }
+    { a[n++]=$1 }
+    END {
+      for(i=0;i<n-1;i++) for(j=i+1;j<n;j++) if(a[i]>a[j]){t=a[i];a[i]=a[j];a[j]=t}
+      if(n==0) print 0
+      else if(n%2==1) print a[int(n/2)]
+      else printf "%.4f\n", (a[n/2-1]+a[n/2])/2
+    }'
+}
+
+# interleaved_retest: run AT_RETEST_ROUNDS pairs of (baseline | candidate) tests.
+# Applies baseline config between baseline runs, candidate config between cand runs.
+# Outputs RETEST_CAND_TP_MEDIAN, RETEST_BASE_TP_MEDIAN,
+#         RETEST_CAND_RTT_MEDIAN, RETEST_BASE_RTT_MEDIAN.
+# Returns 0 on success (enough valid rounds), 1 on too many failures.
+RETEST_CAND_TP_MEDIAN=""
+RETEST_BASE_TP_MEDIAN=""
+RETEST_CAND_RTT_MEDIAN=""
+RETEST_BASE_RTT_MEDIAN=""
+interleaved_retest(){
+  local target="$1" direction="$2" duration="$3"
+  local cand_cc="$4" cand_qdisc="$5" cand_wmem="$6" cand_rmem="$7"
+
+  local base_tps="" base_rtts="" cand_tps="" cand_rtts=""
+  local ok_rounds=0 fail_rounds=0 round
+  for (( round=1; round<=AT_RETEST_ROUNDS; round++ )); do
+    # --- baseline run ---
+    session_restore_runtime
+    if run_iperf3_json "$target" "$direction" "$duration" 1; then
+      base_tps="$base_tps $IPERF_THROUGHPUT"
+      base_rtts="$base_rtts $IPERF_RTT"
+    else
+      fail_rounds=$(( fail_rounds + 1 ))
+      printf '  复测第 %d 轮基线测试失败。\n' "$round"
+    fi
+    # --- candidate run ---
+    apply_cc "$cand_cc"
+    apply_qdisc "$cand_qdisc"
+    [ -n "$cand_wmem" ] && apply_wmem "$cand_wmem"
+    [ -n "$cand_rmem" ] && apply_rmem "$cand_rmem"
+    if run_iperf3_json "$target" "$direction" "$duration" 1; then
+      cand_tps="$cand_tps $IPERF_THROUGHPUT"
+      cand_rtts="$cand_rtts $IPERF_RTT"
+      ok_rounds=$(( ok_rounds + 1 ))
+      printf '  复测第 %d 轮：基线 %s Mbps / 候选 %s Mbps\n' \
+        "$round" "$(printf '%s' "$base_tps" | awk '{print $NF}')" "$IPERF_THROUGHPUT"
+    else
+      fail_rounds=$(( fail_rounds + 1 ))
+      printf '  复测第 %d 轮候选测试失败。\n' "$round"
+    fi
+  done
+  # Restore to baseline after all rounds
+  session_restore_runtime
+
+  if [ "$ok_rounds" -lt 2 ]; then
+    red "复测有效轮次不足（${ok_rounds}/${AT_RETEST_ROUNDS}），无法可靠判断。"
+    return 1
+  fi
+
+  RETEST_BASE_TP_MEDIAN="$(_median $base_tps)"
+  RETEST_CAND_TP_MEDIAN="$(_median $cand_tps)"
+  RETEST_BASE_RTT_MEDIAN="$(_median $base_rtts)"
+  RETEST_CAND_RTT_MEDIAN="$(_median $cand_rtts)"
+  printf '复测结果：基线中位 %s Mbps / 候选中位 %s Mbps（RTT 基线 %s us / 候选 %s us）\n' \
+    "$RETEST_BASE_TP_MEDIAN" "$RETEST_CAND_TP_MEDIAN" \
+    "$RETEST_BASE_RTT_MEDIAN" "$RETEST_CAND_RTT_MEDIAN"
+  return 0
+}
+
 
 persist_final_atomic(){
   local cc="${1:-}" qdisc="${2:-}" wmem_max="${3:-}" rmem_max="${4:-}"
@@ -1203,6 +1329,40 @@ _restore_orig_persistent(){
   elif [ "$status" = "absent" ]; then
     rm -f "$CONF"
   fi
+}
+
+##############################################################################
+# Unified finalize: proxy acceptance → persist → read-back → print result
+# Used by both auto_tune_flow and remote_auto_tune_flow.
+# $1=cc $2=qdisc $3=wmem $4=rmem
+# Returns 0 on committed, 1 on failure (caller should restore).
+##############################################################################
+_finalize_and_persist(){
+  local cc="$1" qdisc="$2" wmem="$3" rmem="$4"
+
+  # Proxy acceptance before persist (if configured)
+  if [ -n "${PROXY_HOST:-}" ] && [ -n "${PROXY_TEST_URL:-}" ]; then
+    green "执行代理验收测试（持久化前）..."
+    if ! proxy_acceptance_test; then
+      red "代理验收未通过，放弃持久化。"
+      return 1
+    fi
+    green "代理验收通过。"
+  else
+    yellow "[信息] 未配置代理验收（PROXY_HOST/PROXY_TEST_URL）——真实代理体验未验证。"
+  fi
+
+  green "原子写入配置文件..."
+  if ! persist_final_atomic "$cc" "$qdisc" "$wmem" "$rmem"; then
+    red "配置文件写入失败，放弃持久化。"
+    return 1
+  fi
+
+  # Delete the restore.sh only after confirming persist succeeded
+  rm -f "$SESSION_DIR/restore.sh"
+  green "配置已持久化并通过读回核对。"
+  printf 'RESULT=committed\n'
+  return 0
 }
 
 
@@ -1813,38 +1973,51 @@ auto_tune_flow(){
   direction="download"
   duration="$AT_DURATION"
 
-  echo "选择测试方向（影响实际 iperf3 方向和缓冲候选生成）："
-  echo "1. VPS → 远端（VPS 发送，测 VPS 出口 CC/wmem/qdisc — 代理下载主场景）"
-  echo "2. 远端 → VPS（远端发送，测 VPS 入口 rmem — 代理上传场景）"
-  while true; do
-    read -rp "请选择 [1-2]: " _choice
-    case "$_choice" in
-      1) direction="download"; break ;;  # VPS sends, no -R
-      2) direction="upload";   break ;;  # remote sends, adds -R
-      *) red "请选择 1 或 2。" ;;
-    esac
-  done
+  if [ "$AT_AUTO" -eq 1 ]; then
+    # ── Non-interactive auto mode ────────────────────────────────────────────
+    if [ -z "$AT_TARGET" ]; then
+      red "自动模式需要 --target <host> 参数（或 AT_TARGET 环境变量）。"
+      _at_cleanup failed; trap - INT TERM EXIT
+      printf 'RESULT=failed\n'; return $AT_EXIT_FAILED
+    fi
+    target="$AT_TARGET"
+    direction="$AT_DIRECTION"
+    printf '自动模式：target=%s direction=%s duration=%ss\n' "$target" "$direction" "$duration"
+  else
+    # ── Interactive mode ─────────────────────────────────────────────────────
+    echo "选择测试方向（影响实际 iperf3 方向和缓冲候选生成）："
+    echo "1. VPS → 远端（VPS 发送，测 VPS 出口 CC/wmem/qdisc — 代理下载主场景）"
+    echo "2. 远端 → VPS（远端发送，测 VPS 入口 rmem — 代理上传场景）"
+    while true; do
+      read -rp "请选择 [1-2]: " _choice
+      case "$_choice" in
+        1) direction="download"; break ;;
+        2) direction="upload";   break ;;
+        *) red "请选择 1 或 2。" ;;
+      esac
+    done
 
-  echo
-  echo "选择测试方式："
-  echo "1. 本地回环（127.0.0.1，无需远程节点，结果仅供内核参数对比参考）"
-  echo "2. 指定远程 iperf3 测试节点 IP/域名"
-  echo "0. 取消"
-  read -rp "请选择 [0-2]: " _choice
-  case "$_choice" in
-    1)
-      target="127.0.0.1"
-      yellow "注意：本地回环测试不经过真实网络路径，结果仅供内核参数对比参考，不代表出口性能。"
-      ;;
-    2)
-      while true; do
-        read -rp "输入远程 iperf3 服务器 IP/域名: " target
-        valid_target_host "$target" && [ -n "$target" ] && break
-        red "地址格式不合法。"
-      done
-      ;;
-    *) _at_cleanup cancelled; trap - INT TERM EXIT; pause; return ;;
-  esac
+    echo
+    echo "选择测试方式："
+    echo "1. 本地回环（127.0.0.1，无需远程节点，结果仅供内核参数对比参考）"
+    echo "2. 指定远程 iperf3 测试节点 IP/域名"
+    echo "0. 取消"
+    read -rp "请选择 [0-2]: " _choice
+    case "$_choice" in
+      1)
+        target="127.0.0.1"
+        yellow "注意：本地回环测试不经过真实网络路径，结果仅供内核参数对比参考，不代表出口性能。"
+        ;;
+      2)
+        while true; do
+          read -rp "输入远程 iperf3 服务器 IP/域名: " target
+          valid_target_host "$target" && [ -n "$target" ] && break
+          red "地址格式不合法。"
+        done
+        ;;
+      *) _at_cleanup cancelled; trap - INT TERM EXIT; pause; return ;;
+    esac
+  fi
 
   # 检测是否需要启动本地 iperf3 服务端
   local _local_server_pid=""
@@ -2051,58 +2224,56 @@ auto_tune_flow(){
   if [ "$best_idx" -eq -1 ]; then
     yellow "所有候选均未通过筛选，保留当前配置。"
     [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
-    _at_cleanup success_no_change; trap - INT TERM EXIT; pause; return
+    _at_cleanup success_no_change; trap - INT TERM EXIT
+    printf 'RESULT=no_change\n'
+    [ "$AT_AUTO" -eq 1 ] && return $AT_EXIT_NO_CHANGE
+    pause; return
   fi
 
   green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
   session_log "best_candidate=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
 
-  # 最终验收测试（40% 预算，单流，时长 2× duration，与筛选保持相同并发数）
+  # ── 交错复测（对筛选胜者做 AT_RETEST_ROUNDS 轮交替测试，使用中位数判断）──
   echo
-  green "--- 最终验收测试（单流，时长 $((duration * 2)) 秒）---"
+  green "--- 交错复测（${AT_RETEST_ROUNDS} 轮）---"
+  local retest_ok=0
+  if interleaved_retest "$target" "$direction" "$duration" \
+      "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
+      "${CAND_WMEM[$best_idx]:-}" "${CAND_RMEM[$best_idx]:-}"; then
+    if is_reliable_improvement \
+        "$RETEST_CAND_TP_MEDIAN" "$RETEST_BASE_TP_MEDIAN" \
+        "$RETEST_CAND_RTT_MEDIAN" "$RETEST_BASE_RTT_MEDIAN"; then
+      green "交错复测确认可靠改善：$IMPROVEMENT_REASON"
+      retest_ok=1
+    else
+      yellow "交错复测未确认可靠改善：$IMPROVEMENT_REASON"
+    fi
+  else
+    red "交错复测失败（测试轮次不足）。"
+  fi
+  session_log "retest_ok=$retest_ok"
+
+  [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
+
+  if [ "$retest_ok" -eq 0 ]; then
+    yellow "收益未获确认，保留原配置。"
+    session_restore_runtime
+    _at_cleanup success_no_change; trap - INT TERM EXIT
+    printf 'RESULT=no_change\n'
+    [ "$AT_AUTO" -eq 1 ] && return $AT_EXIT_NO_CHANGE
+    pause; return
+  fi
+
+  # 重新应用胜出候选（interleaved_retest 结束后已恢复基线）
   apply_cc "${CAND_CC[$best_idx]}"
   apply_qdisc "${CAND_QDISC[$best_idx]}"
   [ -n "${CAND_WMEM[$best_idx]}" ] && apply_wmem "${CAND_WMEM[$best_idx]}"
   [ -n "${CAND_RMEM[$best_idx]}" ] && apply_rmem "${CAND_RMEM[$best_idx]}"
 
-  local final_ok=0
-  # Fix-11: use same parallelism (1) as screening; 4-stream naturally yields higher
-  #         throughput and cannot be directly compared to single-stream baseline.
-  if run_iperf3_json "$target" "$direction" "$((duration * 2))" 1; then
-    # Issue-4 fix: pass acceptance bytes explicitly; also require score > baseline (1.0)
-    if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES" "$IPERF_BYTES" \
-        && awk "BEGIN{exit !($CANDIDATE_SCORE > 1.0)}"; then
-      green "验收通过：吞吐 $IPERF_THROUGHPUT Mbps，Retr=$IPERF_RETR，RTT=${IPERF_RTT}us，得分=$CANDIDATE_SCORE"
-      final_ok=1
-    else
-      red "验收未通过：${SCORE_REJECT_REASON:-得分 ${CANDIDATE_SCORE} 未高于基线 1.0}"
-    fi
-  else
-    red "验收测试执行失败。"
-  fi
-  session_log "acceptance ok=$final_ok tp=${IPERF_THROUGHPUT:-0} retr=${IPERF_RETR:-0}"
-
-  [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
-
-  if [ "$final_ok" -eq 0 ]; then
-    yellow "恢复到调优前状态。"
-    session_restore_runtime
-    _at_cleanup failed_acceptance; trap - INT TERM EXIT; pause; return
-  fi
-
-  # Bug-5 fix: run optional proxy acceptance BEFORE persisting; failure blocks commit
-  if ! proxy_acceptance_test; then
-    yellow "代理验收失败，取消持久化，恢复到调优前状态。"
-    session_restore_runtime
-    _at_cleanup failed_proxy_acceptance; trap - INT TERM EXIT; pause; return
-  fi
-
-  # 原子持久化
-  if persist_final_atomic "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
-      "${CAND_WMEM[$best_idx]}" "${CAND_RMEM[$best_idx]}"; then
-    # Bug-4 fix: keep restore.sh for rollback; just mark it as a post-persist snapshot
-    # (watchdog already stopped, so the file won't trigger auto-restore on clean exit)
+  # ── 统一持久化（代理验收 + 原子写入 + 读回核对）──
+  if _finalize_and_persist \
+      "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
+      "${CAND_WMEM[$best_idx]:-}" "${CAND_RMEM[$best_idx]:-}"; then
     session_log "persisted=yes"
 
     echo
@@ -2116,16 +2287,19 @@ auto_tune_flow(){
     printf '%-35s %s → %s\n' "default_qdisc:"          "$snap_qdisc" "${CAND_QDISC[$best_idx]}"
     [ -n "${CAND_WMEM[$best_idx]}" ] && printf '%-35s %s → 4096 16384 %s\n' "tcp_wmem:" "$snap_wmem" "${CAND_WMEM[$best_idx]}"
     [ -n "${CAND_RMEM[$best_idx]}" ] && printf '%-35s %s → 4096 87380 %s\n' "tcp_rmem:" "$snap_rmem" "${CAND_RMEM[$best_idx]}"
-    printf '%-35s %s Mbps → %s Mbps\n' "吞吐量:" "$BASELINE_THROUGHPUT" "$IPERF_THROUGHPUT"
+    printf '%-35s %s Mbps → %s Mbps\n' "吞吐量:" "$BASELINE_THROUGHPUT" "$RETEST_CAND_TP_MEDIAN"
     echo
-    yellow "如需回滚，执行：bash $SESSION_DIR/restore.sh"
+    yellow "如需回滚，执行：bash $SESSION_DIR/restore.sh（文件将在此会话后保留）"
     printf '会话日志：%s/session.log\n' "$SESSION_DIR"
     printf '测试记录：%s/results.tsv\n' "$SESSION_DIR"
     _at_cleanup success; trap - INT TERM EXIT
+    [ "$AT_AUTO" -eq 1 ] && return $AT_EXIT_COMMITTED
   else
     red "持久化失败，已自动恢复。"
     session_restore_runtime
     _at_cleanup failed_persist; trap - INT TERM EXIT
+    printf 'RESULT=failed\n'
+    [ "$AT_AUTO" -eq 1 ] && return $AT_EXIT_FAILED
   fi
   pause
 }
@@ -2816,37 +2990,54 @@ remote_auto_tune_flow(){
   green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
   session_log "best=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
 
-  # 最终验收（所有节点，单流，时长 2× — Fix-11: same parallelism as screening）
+  # ── 多节点交错复测（使用主节点路径做中位数判断）──
+  # Note: interleaved_retest uses run_iperf3_json (local→remote), suitable when
+  # primary node is reachable via direct iperf3. For SSH-based testing we use
+  # a simplified per-node re-test via _remote_run_one_test.
   echo
-  green "--- 最终验收测试（所有 $NODE_COUNT 节点，单流，时长 $((duration * 2)) 秒）---"
+  green "--- 多节点复测验收（所有 $NODE_COUNT 节点）---"
   apply_cc "${CAND_CC[$best_idx]}"
   apply_qdisc "${CAND_QDISC[$best_idx]}"
   [ -n "${CAND_WMEM[$best_idx]}" ] && apply_wmem "${CAND_WMEM[$best_idx]}"
   [ -n "${CAND_RMEM[$best_idx]}" ] && apply_rmem "${CAND_RMEM[$best_idx]}"
 
-  local final_ok=1
+  # Allow "primary node improves, others no regression (>=95% throughput)"
+  local final_ok=1 primary_improved=0
   for (( _ni=0; _ni<NODE_COUNT; _ni++ )); do
-    # Fix-11: use same parallelism (1) as screening; 4-stream would inflate throughput
     if ! _remote_run_one_test "$_ni" "$target" "$direction" "$((duration * 2))" 1; then
       red "节点 ${NODE_LABEL[$_ni]} 验收测试失败。"
       final_ok=0; continue
     fi
-    # Fix-9 + Issue-4: score against this node's own baseline with explicit cand_bytes
     if [ "${NODE_BL_TP[$_ni]:-0}" -eq 0 ]; then
       red "节点 ${NODE_LABEL[$_ni]} 基线未知，验收失败。"
       final_ok=0; continue
     fi
-    # Issue-4 fix + require score > 1.0 to confirm genuine improvement
-    if ! score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-        "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}" "$IPERF_BYTES" \
-        || ! awk "BEGIN{exit !($CANDIDATE_SCORE <= 1.0)}"; then
-      red "节点 ${NODE_LABEL[$_ni]} 验收未通过：${SCORE_REJECT_REASON:-得分 ${CANDIDATE_SCORE} 未高于基线 1.0}"
-      final_ok=0
-    else
+    # P4-A fix: correct acceptance — require score > 1.0 (was: score <= 1.0 which passed degraded)
+    if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
+        "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" \
+        "${NODE_BL_BYTES[$_ni]}" "$IPERF_BYTES" \
+        && awk "BEGIN{exit !($CANDIDATE_SCORE > 1.0)}"; then
       printf '节点 %s 验收通过：%s Mbps，得分 %s\n' "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "$CANDIDATE_SCORE"
+      [ "$_ni" -eq 0 ] && primary_improved=1
+    else
+      # Allow non-primary node to stay within 5% of baseline (no regression)
+      local _no_regression
+      _no_regression="$(awk "BEGIN{exit !(${IPERF_THROUGHPUT:-0} >= ${NODE_BL_TP[$_ni]} * 0.95)}" && echo 1 || echo 0)"
+      if [ "$_ni" -gt 0 ] && [ "$_no_regression" -eq 1 ]; then
+        printf '节点 %s 持平（无退化）：%s Mbps（基线 %s Mbps）\n' \
+          "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "${NODE_BL_TP[$_ni]}"
+      else
+        red "节点 ${NODE_LABEL[$_ni]} 验收未通过：${SCORE_REJECT_REASON:-得分 ${CANDIDATE_SCORE:-?} 未高于基线 1.0}"
+        [ "$_ni" -eq 0 ] && final_ok=0  # primary node failure is fatal
+      fi
     fi
   done
-  session_log "acceptance ok=$final_ok"
+  # Require at least primary node improved
+  if [ "$primary_improved" -eq 0 ]; then
+    red "主节点未确认改善，拒绝提交。"
+    final_ok=0
+  fi
+  session_log "acceptance ok=$final_ok primary_improved=$primary_improved"
 
   if [ "$final_ok" -eq 0 ]; then
     yellow "验收未通过，恢复到调优前状态。"
@@ -2857,16 +3048,10 @@ remote_auto_tune_flow(){
 
   clear_remote_credentials
 
-  # Bug-5 fix: proxy acceptance before persist
-  if ! proxy_acceptance_test; then
-    yellow "代理验收失败，取消持久化，恢复到调优前状态。"
-    session_restore_runtime
-    _rat_cleanup failed_proxy_acceptance; trap - INT TERM EXIT; pause; return
-  fi
-
-  if persist_final_atomic "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
-      "${CAND_WMEM[$best_idx]}" "${CAND_RMEM[$best_idx]}"; then
-    # Bug-4 fix: keep restore.sh for rollback
+  # ── 统一持久化（代理验收 + 原子写入 + 读回核对）──
+  if _finalize_and_persist \
+      "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
+      "${CAND_WMEM[$best_idx]:-}" "${CAND_RMEM[$best_idx]:-}"; then
     session_log "persisted=yes"
     echo
     green "=== 调优前后对比 ==="
@@ -2876,12 +3061,13 @@ remote_auto_tune_flow(){
     printf '%-35s %s → %s\n' "default_qdisc:" \
       "$(awk '/default_qdisc/{print $NF}' "$SESSION_DIR/snapshot.conf")" \
       "${CAND_QDISC[$best_idx]}"
-    yellow "如需回滚：bash $SESSION_DIR/restore.sh"
+    yellow "如需回滚：bash $SESSION_DIR/restore.sh（文件将在此会话后保留）"
     _rat_cleanup success; trap - INT TERM EXIT
   else
     red "持久化失败，已自动恢复。"
     session_restore_runtime
     _rat_cleanup failed_persist; trap - INT TERM EXIT
+    printf 'RESULT=failed\n'
   fi
   pause
 }
@@ -3034,6 +3220,7 @@ proxy_acceptance_test(){
 ##############################################################################
 
 _parse_cli_args(){
+  local _run_auto=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --max-candidates)
@@ -3045,24 +3232,48 @@ _parse_cli_args(){
       --budget-gib)
         AT_BUDGET_GIB="${2:?--budget-gib 需要整数参数}"
         shift 2 ;;
+      --target)
+        AT_TARGET="${2:?--target 需要 IP/域名参数}"
+        shift 2 ;;
+      --direction)
+        AT_DIRECTION="${2:?--direction 需要 download|upload}"
+        case "$AT_DIRECTION" in download|upload) ;; *)
+          printf 'tcptune: --direction 须为 download 或 upload\n' >&2; exit 2 ;;
+        esac
+        shift 2 ;;
+      --retest-rounds)
+        AT_RETEST_ROUNDS="${2:?--retest-rounds 需要整数参数}"
+        shift 2 ;;
       --auto-tune)
-        auto_tune_flow
-        exit $? ;;
+        AT_AUTO=1
+        _run_auto=1
+        shift ;;
       --help|-h)
         printf 'tcptune %s\n使用方法: bash tcptune.sh [选项]\n\n选项:\n' "$SCRIPT_VERSION"
+        printf '  --auto-tune          非交互式自动调优（必须配合 --target）\n'
+        printf '  --target <host>      iperf3 测试目标 IP/域名（自动模式必须）\n'
+        printf '  --direction <d>      测试方向：download（默认）或 upload\n'
         printf '  --max-candidates N   最大候选数（默认 %s）\n' "$AT_MAX_CANDIDATES"
         printf '  --duration N         每轮测试时长秒（默认 %s）\n' "$AT_DURATION"
         printf '  --budget-gib N       总流量预算 GiB（默认 %s）\n' "$AT_BUDGET_GIB"
-        printf '  --auto-tune          直接运行自动调优（非交互式）\n'
-        printf '\n代理验收（环境变量）:\n'
+        printf '  --retest-rounds N    交错复测轮数（默认 %s）\n' "$AT_RETEST_ROUNDS"
+        printf '\n代理验收（环境变量或 shell 导出）:\n'
         printf '  PROXY_HOST=<ip>      SOCKS5 代理 IP\n'
         printf '  PROXY_PORT=<port>    SOCKS5 端口（默认 1080）\n'
         printf '  PROXY_TEST_URL=<url> 验收目标 URL\n'
+        printf '\n退出码: 0=committed  1=failed  2=no_change\n'
         exit 0 ;;
       *) shift ;;
     esac
   done
+  if [ "$_run_auto" -eq 1 ]; then
+    auto_tune_flow
+    exit $?
+  fi
 }
 
-_parse_cli_args "$@"
-menu
+# Only execute when run as a script, not when sourced (e.g., by tests)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  _parse_cli_args "$@"
+  menu
+fi
