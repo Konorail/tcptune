@@ -72,6 +72,13 @@ validation(){
   AT_RETEST_ROUNDS=5; AT_DURATION=08; assert_bad 'ambiguous octal-like integer rejected' _validate_auto_options
   AT_DURATION=10; AT_MAX_RTT_FACTOR=200; assert_bad 'permissive 200% RTT policy rejected' _validate_auto_options
   AT_MAX_RTT_FACTOR=115; AT_BUDGET_GIB=NaN; assert_bad 'nonfinite budget rejected' _validate_auto_options
+  AT_BUDGET_GIB=20; AT_RATE_MBPS=0
+  assert_bad 'unlimited rate requires explicit byte quota' _validate_auto_options
+  AT_SAMPLE_MIB=256; assert_ok 'unlimited mode accepts a bounded quota' _validate_auto_options
+  AT_SAMPLE_MIB=08; assert_bad 'octal-like quota rejected' _validate_auto_options
+  AT_SAMPLE_MIB=4097; assert_bad 'oversized quota rejected' _validate_auto_options
+  AT_SAMPLE_MIB=256; AT_RATE_MBPS=1000
+  assert_bad 'byte quota cannot silently change timed semantics' _validate_auto_options
 }
 
 normalization(){
@@ -89,14 +96,18 @@ runner_negative(){
   TCPTUNE_TEST_NEGATIVE_CONTROL=1 bash "$TEST_DIR/regression.sh" > "$CASE_TMP/negative.log" 2>&1 || rc=$?
   assert_eq 'intentional assertion failure exits suite nonzero' 1 "$rc"
   assert_ok 'negative suite counts failed child assertion' grep -q 'FAIL=1' "$CASE_TMP/negative.log"
+  : > "$CASE_TMP/empty.json"
+  assert_bad 'empty JSON artifact cannot pass assertions' _json_matches "$CASE_TMP/empty.json" true
 }
 
 cli_order(){
-  auto_tune_flow(){ printf '%s %s %s\n' "$AT_TARGET" "$AT_DURATION" "$AT_NO_PERSIST"; return 2; }
+  auto_tune_flow(){ printf '%s %s %s %s %s\n' "$AT_TARGET" "$AT_DURATION" "$AT_NO_PERSIST" "$AT_RATE_MBPS" "$AT_SAMPLE_MIB"; return 2; }
   local rc=0
   (_parse_cli_args --auto-tune --no-persist --duration 7 --target 192.0.2.1) > "$CASE_TMP/cli" || rc=$?
   assert_eq 'CLI forwards actual flow status' 2 "$rc"
-  assert_eq 'options after --auto-tune are parsed first' '192.0.2.1 7 1' "$(cat "$CASE_TMP/cli")"
+  assert_eq 'options after --auto-tune are parsed first' '192.0.2.1 7 1 1000 0' "$(cat "$CASE_TMP/cli")"
+  (_parse_cli_args --auto-tune --sample-mib 256 --target 192.0.2.1 --rate-mbps 0 --no-persist) > "$CASE_TMP/unlimited-cli" || true
+  assert_eq 'unlimited CLI options reach the tuning flow' '192.0.2.1 10 1 0 256' "$(cat "$CASE_TMP/unlimited-cli")"
   assert_bad 'missing argument fails' bash "$REPO/tcptune.sh" --duration
   assert_bad 'unknown option fails' bash "$REPO/tcptune.sh" --bogus-option
 }
@@ -126,6 +137,20 @@ proxy_probe(){
 }
 _probe_to_file(){ _proxy_probe_impl > "$CASE_TMP/probe.json"; }
 
+candidate_records(){
+  SESSION_DIR="$CASE_TMP"; CURRENT_QDISC=fq_codel
+  CAND_CC=(); CAND_QDISC=(); CAND_WMEM=(); CAND_RMEM=(); CAND_LABEL=()
+  assert_ok 'candidate serializes on supported jq versions' _add_candidate bbr '' '' 'CC=bbr'
+  assert_json 'candidate plan includes its label and parameters' "$SESSION_DIR/candidates.jsonl" \
+    '.label=="CC=bbr" and .cc=="bbr" and .qdisc=="fq_codel" and .wmem_max=="" and .rmem_max==""'
+  assert_ok 'duplicate candidate is ignored' _add_candidate bbr '' '' 'duplicate'
+  assert_eq 'candidate plan has one record' 1 "$(wc -l < "$SESSION_DIR/candidates.jsonl" | tr -d ' ')"
+  rm "$SESSION_DIR/candidates.jsonl"; mkdir "$SESSION_DIR/candidates.jsonl"
+  assert_bad 'plan write failure is surfaced' _add_candidate cubic '' '' 'CC=cubic'
+  assert_eq 'failed plan cannot leave an unrecorded candidate' 1 "${#CAND_CC[@]}"
+}
+
+run_case candidate-plan-json candidate_records
 run_case constraints gates
 run_case proxy-constraints proxy_gates
 run_case paired-evidence paired_stats

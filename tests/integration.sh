@@ -237,6 +237,24 @@ proxy_service_failure(){
   assert_json 'listener failure reason recorded' "$REPORT" '[.decisions[].reason]|index("proxy_service_restart_failed")!=null'
 }
 
+uncapped_temporary(){
+  setup_mock; AT_NO_PERSIST=1; AT_RATE_MBPS=0; AT_SAMPLE_MIB=256
+  run_mock_auto
+  assert_eq 'unlimited mode uses the same independent acceptance flow' 3 "$AUTO_RC"
+  assert_json 'report identifies byte-bounded sampling and verified recovery' "$REPORT" \
+    '.policy.unlimited_rate and .policy.measurement_mode=="byte_bounded" and .policy.sample_mib==256 and .restore_verified and (.persisted|not) and ([.pairs[]|select(.stage=="acceptance")]|length)==3'
+}
+
+candidate_plan_failure(){
+  setup_mock
+  _add_candidate(){ return 1; }
+  run_mock_auto
+  assert_eq 'candidate plan write failure terminates the session' 1 "$AUTO_RC"
+  assert_json 'plan failure reports recovery instead of an ordinary no_change' "$REPORT" \
+    '.reason=="candidate_plan_failed" and .result=="failed" and .restore_verified'
+  assert_eq 'no unrecorded candidate reaches the network' 1 "$(wc -l < "$CASE_TMP/network.log" | tr -d ' ')"
+}
+
 completion_failure(){
   setup_mock
   touch(){
@@ -277,4 +295,6 @@ run_case report-failure report_failure
 run_case proxy-service-refresh proxy_service
 run_case proxy-service-failure proxy_service_failure
 run_case completion-marker-failure completion_failure
+run_case unlimited-temporary uncapped_temporary
+run_case candidate-plan-failure candidate_plan_failure
 finish_suite

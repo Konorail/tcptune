@@ -1,6 +1,6 @@
 # tcptune
 
-面向代理 VPS 的保守 TCP 参数试验工具，v2.1。适用于实际使用 Linux TCP socket 的链路；VLESS 的名称本身不代表传输方式，用户态 QUIC 拥塞控制不属于本工具的调优范围。
+面向代理 VPS 的保守 TCP 参数试验工具，v2.2。适用于实际使用 Linux TCP socket 的链路；VLESS 的名称本身不代表传输方式，用户态 QUIC 拥塞控制不属于本工具的调优范围。
 
 在指定路径、速率、时间和流量预算内寻找**足够好的配置**。原配置始终参与对照，证据不足就 `no_change`，不宣称全局最优或保证提速。
 
@@ -82,11 +82,12 @@ MAD 和 80% 一致性规则都是保守的**启发式策略**，小样本、MAD=
 
 | 参数 | 默认值 |
 | --- | --- |
-| `--duration` | 每次 10 秒，允许 2..120 |
+| `--duration` | 默认 10 秒，允许 2..120；不限速时为最短有效样本时长 |
 | `--retest-rounds` | 5 对，允许 3..15 |
 | `--accept-rounds` | 新数据 3 对，允许 3..15 |
 | `--max-candidates` | 4，最多 16 |
-| `--rate-mbps` | 每流 1000 Mbps 的测试速率上限 |
+| `--rate-mbps` | 每流 1000 Mbps 的测试速率上限；0 表示不限速 |
+| `--sample-mib` | 默认 0；不限速模式必须显式指定每轮 1..4096 MiB 载荷 |
 | `--budget-gib` | 32 GiB 应用层载荷预算 |
 | `--max-seconds` | 1800 秒会话预算 |
 | `--expected-connections` | 64 个并发连接用于缓冲内存预算 |
@@ -94,7 +95,17 @@ MAD 和 80% 一致性规则都是保守的**启发式策略**，小样本、MAD=
 
 一条成功候选在默认设置下至少需 18 次 iperf 测量：基线、初筛、十次复测、六次独立验收。1 Gbps 持续传输约需 21 GiB，再加其他候选和代理流量。因此默认预算从旧版 20 调整为 32 GiB；运行开始会打印预算。可显式降低预算或速率进行流程验证，之后再按实际带宽提高速率。
 
-所有测试共用时间和载荷账本。运行前按时长、速率上限和 10% 余量预留，成功后换成实际传输字节；失败保留预留值。探针也预留并记账。预算不足不开始下一次测量，测试进程受 timeout 限制。
+所有测试共用时间和载荷账本。限速模式按时长、速率上限和 10% 余量预留；不限速模式按每轮字节额度加 128 KiB 写块余量预留。成功解析后按发送/接收两端较大的载荷量记账，失败保留预留值。探针也预留并记账。预算不足不开始下一次测量，测试进程受 timeout 限制。
+
+不限速模式使用 iperf3 `-b 0 -n 字节数`，只支持单流。每轮截止时间为 `--duration + 5` 秒；字节额度过小、实际发送时长不足 `--duration` 时返回 `sample_too_short`，异常超出额度和写块余量时返回 `sample_byte_limit_exceeded`。这些数据仍保留并计费到测试账本，但不能进入收益验收。需要按实际带宽选择字节额度，避免用短突发代替稳定样本；原收益、重传保护和独立验收规则不变。
+
+```bash
+# 约 1 Gbps 路径的示例；每轮 1.5 GiB，默认 18 轮约需 27 GiB 载荷。
+sudo bash tcptune.sh --auto-tune --target PEER_IP --no-persist \
+  --rate-mbps 0 --sample-mib 1536 --duration 10 --budget-gib 32
+```
+
+不同 iperf3 版本的字节终止行为可能存在差异；报告记录实际字节和时长，超量或超时必须拒绝。这仍不是运营商流量硬上限。小预算先验证流程，预算不足时保留原配置。
 
 这是保守的**应用层载荷记账**，不包含所有 TCP/IP 包头、ACK、SSH 控制流量，不能当作运营商计费流量或严格线速硬上限。外部探针必须遵守自己的响应大小、请求数和超时约定；脚本无法强制约束任意外部程序的实际网络行为。
 
@@ -205,6 +216,7 @@ sudo bash /var/lib/tcptune/sessions/latest/restore.sh
 ```bash
 bash -n tcptune.sh
 bash tests/regression.sh
+bash tests/measurement.sh
 bash tests/integration.sh
 bash tests/linux-process.sh
 python3 -m unittest discover -s tests -p 'test_*.py'

@@ -18,7 +18,7 @@ XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 MIB=$((1024 * 1024))
 MIN_WINDOW=87380
 SSH_CONNECT_TIMEOUT=8
-SCRIPT_VERSION="v2.1.0"
+SCRIPT_VERSION="v2.2.0"
 SCRIPT_DATE="2026-10-16"
 
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
@@ -764,6 +764,7 @@ AT_DURATION="${AT_DURATION:-10}"
 AT_BUDGET_GIB="${AT_BUDGET_GIB:-32}"
 AT_MAX_SECONDS="${AT_MAX_SECONDS:-1800}"
 AT_RATE_MBPS="${AT_RATE_MBPS:-1000}" # explicit per-test TCP rate ceiling
+AT_SAMPLE_MIB="${AT_SAMPLE_MIB:-0}" # required byte quota when rate=0
 AT_RETEST_ROUNDS="${AT_RETEST_ROUNDS:-5}"
 AT_ACCEPT_ROUNDS="${AT_ACCEPT_ROUNDS:-3}"
 AT_MAX_SHORTLIST="${AT_MAX_SHORTLIST:-3}"
@@ -982,11 +983,13 @@ watchdog_start(){
       [ -f "$SESSION_DIR/complete" ] && exit 0
       if [ "$(date +%s)" -ge "$deadline" ]; then
         kill -TERM "$parent_pid" 2>/dev/null || true
-        sleep 5
+        sleep 5 9>&-
         kill -KILL "$parent_pid" 2>/dev/null || true
         break
       fi
-      sleep 2
+      # Keep the inherited lock in the watchdog, not its sleeper: the latter
+      # can outlive watchdog_stop and delay the next session.
+      sleep 2 9>&-
     done
     if [ ! -f "$SESSION_DIR/complete" ] && [ "$(cat "$STATE_DIR/active-session" 2>/dev/null)" = "$SESSION_DIR" ]; then
       bash "$restore_script" --watchdog >> "$SESSION_DIR/watchdog.log" 2>&1
@@ -1063,6 +1066,7 @@ run_iperf3_json(){
   local target="$1" direction="$2" duration="$3" parallel="${4:-1}"
   local remaining reservation probe_reserve=0 started raw probe_file rc probe_rc=0 pid sampler=""
   local resources_before resources_after socket_file sndbuf_pct
+  local sample_limit=0 accounted_bytes mode=timed
   IPERF_THROUGHPUT=0; IPERF_RETR=null; IPERF_RTT=null; IPERF_BYTES=0
   IPERF_SNDBUF_LIMITED=0; IPERF_RWND_LIMITED=0
   IPERF_SNDBUF_EVIDENCE=0
@@ -1070,8 +1074,16 @@ run_iperf3_json(){
   MEASURE_REASON=""
   remaining=$(( RUN_START + AT_MAX_SECONDS - $(date +%s) ))
   [ "$remaining" -ge $((duration + 5)) ] || { MEASURE_REASON=time_budget_exhausted; return 2; }
-  # Payload estimate with 10% reserve, including every stream. Not a wire-byte cap.
-  reservation="$(awk -v d="$duration" -v r="$AT_RATE_MBPS" -v p="$parallel" 'BEGIN{printf "%.0f", d*r*1000000/8*p*1.10}')"
+  if [ "$AT_RATE_MBPS" -eq 0 ]; then
+    [ "$AT_SAMPLE_MIB" -gt 0 ] && [ "$parallel" -eq 1 ] || { MEASURE_REASON=invalid_byte_quota; return 1; }
+    mode=byte_bounded
+    sample_limit=$((AT_SAMPLE_MIB * 1048576))
+    # iperf's quota is payload, not wire bytes. Allow one default TCP write block.
+    reservation=$((sample_limit + 131072))
+  else
+    # Payload estimate with 10% reserve, including every stream. Not a wire-byte cap.
+    reservation="$(awk -v d="$duration" -v r="$AT_RATE_MBPS" -v p="$parallel" 'BEGIN{printf "%.0f", d*r*1000000/8*p*1.10}')"
+  fi
   if [ -n "$AT_PROBE_COMMAND" ]; then probe_reserve=$(( ${PROXY_MAX_BYTES:-33554432} + ${PROXY_REQUESTS:-20} * ${PROXY_SMALL_MAX_BYTES:-65536} )); fi
   [ $(( BUDGET_USED_BYTES + reservation + probe_reserve )) -le "$BUDGET_LIMIT_BYTES" ] || { MEASURE_REASON=traffic_budget_exhausted; return 2; }
   _at_budget_add $((reservation + probe_reserve))
@@ -1081,7 +1093,9 @@ run_iperf3_json(){
   started="$(date +%s)"
   resources_before="$(_resource_snapshot)" || return 1
   socket_file="${raw%.json}.ss.txt"
-  local args=(-c "$target" -J --get-server-output -t "$duration" -b "${AT_RATE_MBPS}M")
+  local args=(-c "$target" -J --get-server-output)
+  if [ "$AT_RATE_MBPS" -eq 0 ]; then args+=(-b 0 -n "$sample_limit")
+  else args+=(-t "$duration" -b "${AT_RATE_MBPS}M"); fi
   [ "$direction" = upload ] && args+=(-R)
   [ "$parallel" -gt 1 ] && args+=(-P "$parallel")
   timeout --signal=TERM --kill-after=3 "$((duration+5))" iperf3 "${args[@]}" > "$raw" 2>"${raw%.json}.stderr" &
@@ -1116,18 +1130,30 @@ run_iperf3_json(){
       (.server_output_json // {}) as $server |
       ([.end.streams[]?.sender.mean_rtt, $server.end.streams[]?.sender.mean_rtt] | map(select(type=="number" and .>0))) as $rtt |
       {tp:($recv.bits_per_second/1000000), bytes:$recv.bytes,
+       accounted_bytes:([$recv.bytes,.end.sum_sent.bytes,$server.end.sum_sent.bytes] | map(select(type=="number")) | max),
+       seconds:(.end.sum_sent.seconds // $server.end.sum_sent.seconds // $recv.seconds // null),
        retr:(.end.sum_sent.retransmits // $server.end.sum_sent.retransmits // null),
        rtt:(if ($rtt|length)>0 then ($rtt|add/length) else null end),
        sndbuf:(.end.sum_sent.sndbuf_limited // $server.end.sum_sent.sndbuf_limited // 0),
        rwnd:(.end.sum_sent.rwnd_limited // $server.end.sum_sent.rwnd_limited // 0)} |
       select(.tp>0 and .bytes>0 and (.tp|type)=="number" and (.bytes|type)=="number" and
         (.bytes|floor)==.bytes and .bytes<=9007199254740991 and
+        (.accounted_bytes|type)=="number" and .accounted_bytes>=.bytes and
+        (.accounted_bytes|floor)==.accounted_bytes and .accounted_bytes<=9007199254740991 and
         (.retr==null or ((.retr|type)=="number" and .retr>=0 and (.retr|floor)==.retr)))
     ' "$raw" 2>/dev/null)" || parsed='{}'
     if jq -e '.tp>0 and .bytes>0' <<< "$parsed" >/dev/null; then
       read -r IPERF_THROUGHPUT IPERF_BYTES IPERF_RETR IPERF_RTT IPERF_SNDBUF_LIMITED IPERF_RWND_LIMITED < <(jq -r '[.tp,.bytes,.retr,.rtt,.sndbuf,.rwnd]|map(if .==null then "null" else tostring end)|@tsv' <<< "$parsed")
-      BUDGET_USED_BYTES=$(( BUDGET_USED_BYTES - reservation + IPERF_BYTES ))
+      accounted_bytes="$(jq -r .accounted_bytes <<< "$parsed")"
+      BUDGET_USED_BYTES=$(( BUDGET_USED_BYTES - reservation + accounted_bytes ))
       status=ok
+      if [ "$AT_RATE_MBPS" -eq 0 ]; then
+        if [ "$accounted_bytes" -gt "$reservation" ]; then
+          status=failed; MEASURE_REASON=sample_byte_limit_exceeded
+        elif ! jq -e --argjson minimum "$duration" '.seconds|type=="number" and .>=$minimum' <<< "$parsed" >/dev/null; then
+          status=failed; MEASURE_REASON=sample_too_short
+        fi
+      fi
     fi
   fi
   if [ -n "$AT_PROBE_COMMAND" ]; then
@@ -1151,10 +1177,12 @@ run_iperf3_json(){
     --argjson started "$started" --argjson ended "$(date +%s)" --arg raw "${raw##*/}" \
     --argjson metrics "$parsed" --argjson proxy "$IPERF_PROXY" --argjson actual "$actual" \
     --argjson before "$resources_before" --argjson after "$resources_after" --argjson sndbuf_evidence "$IPERF_SNDBUF_EVIDENCE" \
+    --arg mode "$mode" --argjson sample_limit "$sample_limit" --argjson minimum "$duration" --argjson process_rc "$rc" \
     '{seq:$seq,stage:$stage,role:$role,candidate:$candidate,target:$target,direction:$direction,
       sender:(if $direction=="download" then "tuned_vps" else "peer" end),
       receiver:(if $direction=="download" then "peer" else "tuned_vps" end),
-      status:$status,reason:$reason,started:$started,ended:$ended,raw:$raw,
+      status:$status,reason:$reason,process_exit_code:$process_rc,started:$started,ended:$ended,raw:$raw,
+      limits:{mode:$mode,requested_seconds:$minimum,payload_quota_bytes:$sample_limit,timeout_seconds:($minimum+5)},
       metrics:$metrics,proxy:$proxy,actual:$actual,resources:{before:$before,after:$after},sender_buffer_limited_evidence:($sndbuf_evidence==1)}' >> "$SESSION_DIR/measurements.jsonl" || return 1
   [ "$status" = ok ]
 }
@@ -1362,7 +1390,7 @@ _write_report(){
     --arg target "$AT_TARGET" --arg direction "$AT_DIRECTION" --arg iface "$ACTUAL_IFACE" \
     --argjson selected "$RUN_SELECTED" --argjson persisted "$([ "$RUN_COMMITTED" -eq 1 ] && echo true || echo false)" \
     --argjson restored "$RUN_RESTORE_VERIFIED" --argjson used "$BUDGET_USED_BYTES" --argjson limit "$BUDGET_LIMIT_BYTES" \
-    --argjson rate "$AT_RATE_MBPS" --argjson started "$RUN_START" --argjson ended "$(date +%s)" \
+    --argjson rate "$AT_RATE_MBPS" --argjson sample_mib "$AT_SAMPLE_MIB" --argjson started "$RUN_START" --argjson ended "$(date +%s)" \
     --argjson actual "$actual" --argjson stats "$RETEST_STATS" --argjson policy "$policy" \
     --argjson request "${WINNER_CONFIG:-null}" --arg probe "$AT_PROBE_COMMAND" --arg service "$AT_PROXY_SERVICE" \
     --slurpfile original "$SESSION_DIR/original.json" --slurpfile measurements "$SESSION_DIR/measurements.jsonl" \
@@ -1374,7 +1402,9 @@ _write_report(){
       restore_attempted:($persisted|not),restore_verified:$restored,reboot_verified:false,
       proxy_experience:(if $probe=="" then "not_verified" else "measured_on_probe_host" end),
       proxy_service:$service,listener_refresh:(if $service=="" then "not_managed" else "explicit_service_restart" end),
-      policy:($policy+{rate_ceiling_mbps:$rate,noise_rule:"paired_median_and_MAD_heuristic",statistical_significance_claimed:false,qdisc:"preserved"}),
+      policy:($policy+{rate_ceiling_mbps:$rate,unlimited_rate:($rate==0),sample_mib:$sample_mib,
+        measurement_mode:(if $rate==0 then "byte_bounded" else "timed" end),
+        noise_rule:"paired_median_and_MAD_heuristic",statistical_significance_claimed:false,qdisc:"preserved"}),
       budget:{used_or_reserved_payload_bytes:$used,limit_bytes:$limit,wire_byte_hard_cap:false},
       original:$original[0],requested:$request,final:$actual,acceptance:$stats,candidates:$candidates,decisions:$decisions,
       measurements:$measurements,pairs:$pairs}' > "$tmp" || return 1
@@ -1932,10 +1962,20 @@ mystery_tune_menu(){
 
 _validate_auto_options(){
   local name value
-  for name in AT_MAX_CANDIDATES AT_DURATION AT_MAX_SECONDS AT_RATE_MBPS AT_RETEST_ROUNDS AT_ACCEPT_ROUNDS AT_MAX_SHORTLIST AT_EXPECTED_CONNECTIONS AT_BUFFER_MAX_MIB; do
+  for name in AT_MAX_CANDIDATES AT_DURATION AT_MAX_SECONDS AT_RETEST_ROUNDS AT_ACCEPT_ROUNDS AT_MAX_SHORTLIST AT_EXPECTED_CONNECTIONS AT_BUFFER_MAX_MIB; do
     value="${!name}"
     [[ "$value" =~ ^[1-9][0-9]{0,5}$ ]] || { red "无效正整数: $name=$value"; return 1; }
   done
+  for name in AT_RATE_MBPS AT_SAMPLE_MIB; do
+    value="${!name}"
+    [[ "$value" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { red "无效非负整数: $name=$value"; return 1; }
+  done
+  [ "$AT_SAMPLE_MIB" -le 4096 ] || return 1
+  if [ "$AT_RATE_MBPS" -eq 0 ]; then
+    [ "$AT_SAMPLE_MIB" -gt 0 ] || { red '不限速模式需要 --sample-mib 指定每轮载荷上限。'; return 1; }
+  else
+    [ "$AT_SAMPLE_MIB" -eq 0 ] || { red '--sample-mib 仅用于 --rate-mbps 0。'; return 1; }
+  fi
   [ "$AT_MAX_CANDIDATES" -le 16 ] && [ "$AT_MAX_SHORTLIST" -le 3 ] &&
     [ "$AT_DURATION" -ge 2 ] && [ "$AT_DURATION" -le 120 ] &&
     [ "$AT_RETEST_ROUNDS" -ge 3 ] && [ "$AT_RETEST_ROUNDS" -le 15 ] &&
@@ -2031,10 +2071,11 @@ _add_candidate(){
     [ "${CAND_CC[$i]}:${CAND_WMEM[$i]}:${CAND_RMEM[$i]}" != "$cc:$w:$r" ] || return 0
   done
   i=${#CAND_CC[@]}
+  jq -cn --arg candidate_label "$label" --arg cc "$cc" --arg q "$CURRENT_QDISC" --arg w "$w" --arg r "$r" \
+    '{label:$candidate_label,cc:$cc,qdisc:$q,wmem_max:$w,rmem_max:$r}' >> "$SESSION_DIR/candidates.jsonl" || return 1
   CAND_CC[$i]="$cc"; CAND_QDISC[$i]="$CURRENT_QDISC"
   CAND_WMEM[$i]="$w"; CAND_RMEM[$i]="$r"; CAND_LABEL[$i]="$label"
-  jq -cn --arg label "$label" --arg cc "$cc" --arg q "$CURRENT_QDISC" --arg w "$w" --arg r "$r" \
-    '{label:$label,cc:$cc,qdisc:$q,wmem_max:$w,rmem_max:$r}' >> "$SESSION_DIR/candidates.jsonl"
+  return 0
 }
 
 _record_decision(){
@@ -2066,7 +2107,7 @@ _buffer_candidates(){
     value="$(awk -v t="$BASELINE_THROUGHPUT" -v r="$BASELINE_RTT" -v f="$factor" 'BEGIN{printf "%.0f",t*r/8*f}')"
     [ "$value" -le "$cap" ] || value="$cap"
     [ "$value" -gt "$current" ] || continue
-    _add_candidate "$cc" "$value" "" "CC=$cc,wmem_max=$value"
+    _add_candidate "$cc" "$value" "" "CC=$cc,wmem_max=$value" || return 1
   done
 }
 
@@ -2093,7 +2134,12 @@ _auto_main(){
   watchdog_start "$SESSION_DIR/restore.sh" || { RUN_REASON=watchdog_failed; return 1; }
   _prepare_proxy_probe || { RUN_REASON=proxy_probe_setup_failed; return 1; }
   if [ -n "$AT_PROXY_SERVICE" ]; then _restart_proxy_service || { RUN_REASON=proxy_service_restart_failed; return 1; }; fi
-  printf '会话: %s\n目标: %s；方向: %s；速率上限: %s Mbps；载荷预算: %s GiB\n' "$SESSION_DIR" "$AT_TARGET" "$AT_DIRECTION" "$AT_RATE_MBPS" "$AT_BUDGET_GIB"
+  local rate_display="${AT_RATE_MBPS} Mbps"
+  [ "$AT_RATE_MBPS" -ne 0 ] || rate_display=不限速
+  printf '会话: %s\n目标: %s；方向: %s；速率上限: %s；载荷预算: %s GiB\n' "$SESSION_DIR" "$AT_TARGET" "$AT_DIRECTION" "$rate_display" "$AT_BUDGET_GIB"
+  if [ "$AT_RATE_MBPS" -eq 0 ]; then
+    printf '不限速；每轮 %s MiB 载荷；至少 %s 秒样本；单轮超时 %s 秒。\n' "$AT_SAMPLE_MIB" "$AT_DURATION" "$((AT_DURATION+5))"
+  fi
   session_log "start target=$AT_TARGET direction=$AT_DIRECTION no_persist=$AT_NO_PERSIST"
   MEASURE_STAGE=baseline; MEASURE_ROLE=baseline; MEASURE_CANDIDATE=original
   if ! run_iperf3_json "$AT_TARGET" "$AT_DIRECTION" "$AT_DURATION" 1; then
@@ -2115,12 +2161,16 @@ _auto_main(){
   if [ "$AT_DIRECTION" = download ]; then
     for cc in bbr cubic; do
       [ "$cc" = "$current_cc" ] && continue
-      [[ " $available_cc " == *" $cc "* ]] && _add_candidate "$cc" "" "" "CC=$cc"
+      if [[ " $available_cc " == *" $cc "* ]]; then
+        _add_candidate "$cc" "" "" "CC=$cc" || { RUN_REASON=candidate_plan_failed; return 1; }
+      fi
     done
   fi
   # Receiving-side buffer evidence is deliberately not inferred from -P4.
   # If no sending CC candidate exists, measured sndbuf evidence may still refine.
-  if [ "${#CAND_CC[@]}" -eq 0 ]; then _buffer_candidates "$current_cc"; fi
+  if [ "${#CAND_CC[@]}" -eq 0 ]; then
+    _buffer_candidates "$current_cc" || { RUN_REASON=candidate_plan_failed; return 1; }
+  fi
   RES_SCORE=(); SHORTLIST=()
   best_screen_cc="$current_cc"; local best_score=1 buffer_added=0
   for ((idx=0;idx<${#CAND_CC[@]};idx++)); do
@@ -2159,7 +2209,8 @@ _auto_main(){
     fi
     # Once CC screening is complete, add a small buffer refinement on its leader.
     if [ "$buffer_added" -eq 0 ] && [ "$idx" -eq $((${#CAND_CC[@]}-1)) ]; then
-      buffer_added=1; _buffer_candidates "$best_screen_cc"
+      buffer_added=1
+      _buffer_candidates "$best_screen_cc" || { RUN_REASON=candidate_plan_failed; return 1; }
     fi
   done
   session_restore_runtime || { RUN_REASON=baseline_restore_failed; return 1; }
@@ -2770,7 +2821,7 @@ _parse_cli_args(){
     case "$option" in
       --auto-tune) AT_AUTO=1; run_auto=1; shift ;;
       --no-persist) AT_NO_PERSIST=1; shift ;;
-      --target|--direction|--max-candidates|--duration|--budget-gib|--max-seconds|--rate-mbps|--retest-rounds|--accept-rounds|--expected-connections|--buffer-max-mib|--probe-command|--proxy-service|--primary-node)
+      --target|--direction|--max-candidates|--duration|--budget-gib|--max-seconds|--rate-mbps|--sample-mib|--retest-rounds|--accept-rounds|--expected-connections|--buffer-max-mib|--probe-command|--proxy-service|--primary-node)
         [ $# -ge 2 ] && [[ "$2" != --* ]] || _cli_error "$option 缺少参数"
         value="$2"
         case "$option" in
@@ -2781,6 +2832,7 @@ _parse_cli_args(){
           --budget-gib) variable=AT_BUDGET_GIB ;;
           --max-seconds) variable=AT_MAX_SECONDS ;;
           --rate-mbps) variable=AT_RATE_MBPS ;;
+          --sample-mib) variable=AT_SAMPLE_MIB ;;
           --retest-rounds) variable=AT_RETEST_ROUNDS ;;
           --accept-rounds) variable=AT_ACCEPT_ROUNDS ;;
           --expected-connections) variable=AT_EXPECTED_CONNECTIONS ;;
@@ -2798,12 +2850,13 @@ tcptune $SCRIPT_VERSION
   --direction download|upload   download=VPS发送，upload=VPS接收
   --no-persist                  临时验证，结束后恢复（成功退出码3）
   --max-candidates N            最大候选数（默认$AT_MAX_CANDIDATES）
-  --duration N                  每次测量2..120秒（默认$AT_DURATION）
+  --duration N                  限速测量时长；不限速时最短有效样本2..120秒（默认$AT_DURATION）
   --retest-rounds N             复测3..15对（默认$AT_RETEST_ROUNDS）
   --accept-rounds N             独立验收3..15对（默认$AT_ACCEPT_ROUNDS）
   --budget-gib N                应用层载荷预算（默认$AT_BUDGET_GIB GiB；非线速硬上限）
   --max-seconds N               会话时间预算（默认$AT_MAX_SECONDS秒）
-  --rate-mbps N                 每流iperf速率上限（默认$AT_RATE_MBPS Mbps）
+  --rate-mbps N                 每流iperf速率上限；0=不限速（默认$AT_RATE_MBPS Mbps）
+  --sample-mib N                不限速必填，每轮1..4096 MiB载荷；另预留128 KiB写块余量
   --expected-connections N      缓冲内存预算并发数（默认$AT_EXPECTED_CONNECTIONS）
   --buffer-max-mib N            单连接缓冲上限（默认$AT_BUFFER_MAX_MIB MiB）
   --probe-command PATH          可执行测量回调，仅路径，不使用eval

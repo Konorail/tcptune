@@ -20,7 +20,7 @@ assert_bad(){
   if "$@"; then T_FAIL=$((T_FAIL+1)); printf '  FAIL %s (unexpected success)\n' "$label"
   else T_PASS=$((T_PASS+1)); printf '  PASS %s\n' "$label"; fi
 }
-_json_matches(){ jq -e "$2" "$1" >/dev/null; }
+_json_matches(){ [ -s "$1" ] && jq -e "$2" "$1" >/dev/null; }
 assert_json(){ local label="$1" file="$2" expression="$3"; assert_ok "$label" _json_matches "$file" "$expression"; }
 run_case(){
   local label="$1" fn="$2" rc p f r=0
@@ -98,7 +98,7 @@ setup_mock(){
   AT_AUTO=1; AT_TARGET=192.0.2.1; AT_DIRECTION=download
   AT_DURATION=2; AT_RETEST_ROUNDS=3; AT_ACCEPT_ROUNDS=3
   AT_MAX_CANDIDATES=4; AT_MAX_SHORTLIST=3; AT_MAX_SECONDS=300
-  AT_RATE_MBPS=1000; AT_BUDGET_GIB=20; AT_NO_PERSIST=0
+  AT_RATE_MBPS=1000; AT_SAMPLE_MIB=0; AT_BUDGET_GIB=20; AT_NO_PERSIST=0
   AT_MIN_TP_GAIN=5; AT_MIN_RTT_GAIN=20; AT_MAX_RTT_FACTOR=115
   AT_RTT_TOLERANCE_MS=5; AT_MAX_RETR_FACTOR=300; AT_RETR_FLOOR=100
   AT_PROBE_COMMAND=""; AT_PROXY_SERVICE=""; PROXY_HOST=""; PROXY_TEST_URL=""

@@ -18,6 +18,37 @@ atomic_lock(){
   lock_release
 }
 
+watchdog_stop_unlocks(){
+  declare -f watchdog_start watchdog_stop > "$CASE_TMP/real-watchdog.sh"
+  setup_mock; unset -f flock
+  source "$CASE_TMP/real-watchdog.sh"
+  SESSION_DIR="$CASE_TMP/watchdog-session"; mkdir -p "$SESSION_DIR"
+  RUN_START="$(date +%s)"; AT_MAX_SECONDS=120
+  # Signal only after the sleeper exists, so stopping the watchdog reliably
+  # exercises a surviving child instead of depending on scheduler timing.
+  sleep(){
+    command sleep "$@" &
+    local sleeper=$!
+    printf '%s\n' "$sleeper" > "$CASE_TMP/watchdog-sleeper"
+    wait "$sleeper"
+  }
+  assert_ok 'session acquires real lock' lock_acquire
+  watchdog_start "$SESSION_DIR/unused-restore.sh"
+  local i sleeper=''
+  for ((i=0;i<100;i++)); do
+    [ ! -s "$CASE_TMP/watchdog-sleeper" ] || break
+    command sleep 0.05
+  done
+  assert_ok 'watchdog has started its sleeper' test -s "$CASE_TMP/watchdog-sleeper"
+  watchdog_stop
+  lock_release
+  assert_ok 'next session immediately acquires lock after watchdog stops' flock -n "$STATE_DIR/tuning.lock" true
+  if [ -s "$CASE_TMP/watchdog-sleeper" ]; then
+    read -r sleeper < "$CASE_TMP/watchdog-sleeper"
+    kill "$sleeper" 2>/dev/null || true
+  fi
+}
+
 watchdog_kill(){
   declare -f watchdog_start watchdog_stop > "$CASE_TMP/real-watchdog.sh"
   setup_mock; unset -f flock
@@ -53,6 +84,7 @@ watchdog_kill(){
 watchdog_deadline(){ WATCHDOG_MODE=deadline; watchdog_kill; }
 
 run_case atomic-real-flock atomic_lock
+run_case stopped-watchdog-releases-lock watchdog_stop_unlocks
 run_case killed-parent-watchdog watchdog_kill
 run_case hung-parent-deadline watchdog_deadline
 finish_suite
