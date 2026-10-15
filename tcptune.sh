@@ -788,6 +788,13 @@ session_create(){
     printf 'net.ipv4.tcp_rmem = %s\n'                      "$(sysctl_value net.ipv4.tcp_rmem)"
     printf 'net.core.rmem_max = %s\n'                      "$(sysctl_value net.core.rmem_max)"
     printf 'net.core.wmem_max = %s\n'                      "$(sysctl_value net.core.wmem_max)"
+    # Save actual egress interface qdisc (separate from default_qdisc sysctl)
+    # Used by session_restore_runtime and restore.sh to undo tc qdisc changes.
+    local _snap_iface _snap_qdisc
+    _snap_iface="$(ip route show default 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    _snap_qdisc="$(tc qdisc show dev "$_snap_iface" 2>/dev/null | awk 'NR==1{print $2}')"
+    printf '# iface_qdisc: %s %s\n' "${_snap_iface:-}" "${_snap_qdisc:-unknown}"
+    true
   } > "$SESSION_DIR/snapshot.conf" || return 1
   printf 'results_header\n' > "$SESSION_DIR/results.tsv"
   printf 'label\tthroughput_mbps\tretr\trtt_us\tscore\tstatus\n' >> "$SESSION_DIR/results.tsv"
@@ -798,26 +805,49 @@ session_create(){
   else
     printf 'absent\n' > "$SESSION_DIR/orig_persistent.status"
   fi
-  # 写入恢复脚本（持久化成功后删除）
+  # Issue-2 fix: rewrite restore.sh to use the same correct parsing as session_restore_runtime:
+  # - Split on first " = " only (preserves multi-word values like "4096 16384 4194304")
+  # - Also restore actual egress interface qdisc from the saved # iface_qdisc: comment
   cat > "$SESSION_DIR/restore.sh" << 'RESTORE_INNER'
 #!/usr/bin/env bash
+# tcptune session restore script — auto-generated, do not edit.
+# Usage: bash /path/to/session/restore.sh
 set -e
 src="$(dirname "$(readlink -f "$0")")"
 snap="$src/snapshot.conf"
 orig_status="$src/orig_persistent.status"
 orig_conf="$src/orig_persistent.conf"
 conf="/etc/sysctl.d/99-tcptune.conf"
-[ -f "$snap" ] || exit 1
-while IFS=' = ' read -r key value; do
-  [[ "$key" =~ ^# ]] && continue
-  [[ -z "$key" ]] && continue
-  sysctl -w "${key// /}=${value// /}" >/dev/null 2>&1 || true
+[ -f "$snap" ] || { echo "ERROR: snapshot not found: $snap" >&2; exit 1; }
+echo "Restoring runtime sysctl values from snapshot..."
+while IFS= read -r _line; do
+  [[ "$_line" =~ ^# ]] && continue
+  [[ -z "${_line// /}" ]] && continue
+  _key="${_line%% = *}"
+  _val="${_line#* = }"
+  _key="${_key// /}"
+  [ -z "$_key" ] && continue
+  sysctl -w "${_key}=${_val}" >/dev/null 2>&1 || true
 done < "$snap"
+# Restore actual egress interface qdisc (saved in snapshot as: # iface_qdisc: <iface> <qdisc>)
+_iface_qdisc_line="$(awk '/^# iface_qdisc:/{print; exit}' "$snap" 2>/dev/null)"
+if [ -n "$_iface_qdisc_line" ]; then
+  _iface="$(printf '%s' "$_iface_qdisc_line" | awk '{print $3}')"
+  _qdisc="$(printf '%s' "$_iface_qdisc_line" | awk '{print $4}')"
+  if [ -n "$_iface" ] && [ -n "$_qdisc" ] && [ "$_qdisc" != "unknown" ]; then
+    echo "Restoring qdisc on $_iface: tc qdisc replace dev $_iface root $_qdisc"
+    tc qdisc replace dev "$_iface" root "$_qdisc" 2>/dev/null || \
+      echo "WARNING: tc qdisc restore failed for $_iface (may need manual fix)" >&2
+  fi
+fi
+# Restore persistent config file
 status="$(cat "$orig_status" 2>/dev/null)"
 if [ "$status" = "exists" ] && [ -f "$orig_conf" ]; then
   cp "$orig_conf" "$conf"
+  echo "Restored persistent config: $conf"
 elif [ "$status" = "absent" ]; then
   rm -f "$conf"
+  echo "Removed persistent config (was absent before this session)."
 fi
 sysctl --system >/dev/null 2>&1 || true
 echo "已恢复会话快照。"
@@ -828,15 +858,14 @@ RESTORE_INNER
 }
 
 session_restore_runtime(){
-  # Bug-1 fix: IFS=' = ' strips spaces from multi-word values like "4096 16384 4194304".
-  # Read key and raw remainder separately with read -r key rest, then strip only the
-  # leading " = " separator, preserving internal spaces in the value.
+  # Issue-2/3 fix: correct parsing preserving multi-word sysctl values.
+  # Also restores actual egress interface qdisc from saved snapshot state.
   local snap="$SESSION_DIR/snapshot.conf"
   [ -f "$snap" ] || { red "找不到会话快照：$snap"; return 1; }
   while IFS= read -r _line; do
     [[ "$_line" =~ ^# ]] && continue
     [[ -z "${_line// /}" ]] && continue
-    # Split on first " = " only
+    # Split on first " = " only (preserves spaces inside values like "4096 16384 4194304")
     local _key _val
     _key="${_line%% = *}"
     _val="${_line#* = }"
@@ -844,11 +873,14 @@ session_restore_runtime(){
     [ -z "$_key" ] && continue
     sysctl -w "${_key}=${_val}" >/dev/null 2>&1 || true
   done < "$snap"
-  # Bug-3 fix: also restore actual egress interface qdisc when reverting
+  # Issue-3 fix: restore actual interface qdisc from snapshot (not from default_qdisc sysctl)
+  # Snapshot stores: # iface_qdisc: <iface> <qdisc>
   if [ -n "$ACTUAL_IFACE" ]; then
-    local orig_qdisc
-    orig_qdisc="$(awk '/default_qdisc/{print $NF}' "$snap" 2>/dev/null)"
-    [ -n "$orig_qdisc" ] && tc qdisc replace dev "$ACTUAL_IFACE" root "$orig_qdisc" 2>/dev/null || true
+    local orig_iface_qdisc
+    orig_iface_qdisc="$(awk '/^# iface_qdisc:/{print $4; exit}' "$snap" 2>/dev/null)"
+    if [ -n "$orig_iface_qdisc" ] && [ "$orig_iface_qdisc" != "unknown" ]; then
+      tc qdisc replace dev "$ACTUAL_IFACE" root "$orig_iface_qdisc" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -974,13 +1006,25 @@ apply_cc(){
 }
 
 apply_qdisc(){
-  # Bug-3 fix: sysctl default_qdisc only affects new interfaces; existing interfaces
-  # keep their old qdisc.  Also call `tc qdisc replace` on the actual egress interface
-  # so the test actually exercises the intended qdisc.
+  # Issue-3b fix: only replace the interface qdisc when the current qdisc is a
+  # simple leaf we can safely swap and fully restore.  Complex hierarchies (mq, htb,
+  # hfsc, tbf, ingress) must not be overwritten — skip the tc change and log a notice.
+  # tc errors are no longer silently swallowed; failure causes the function to return 1.
   local qdisc="$1"
   sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1
   if [ -n "$ACTUAL_IFACE" ]; then
-    tc qdisc replace dev "$ACTUAL_IFACE" root "$qdisc" 2>/dev/null || true
+    # Safe leaf qdiscs we know we can replace and restore atomically
+    case "${ACTUAL_QDISC:-}" in
+      pfifo_fast|pfifo|fq|fq_codel|bfifo|cake|sfq)
+        if ! tc qdisc replace dev "$ACTUAL_IFACE" root "$qdisc" 2>/dev/null; then
+          yellow "警告：tc qdisc replace dev $ACTUAL_IFACE root $qdisc 失败，sysctl 已更新但接口队列未改变。"
+          return 1
+        fi
+        ;;
+      *)
+        yellow "跳过接口 $ACTUAL_IFACE 的 qdisc 修改（当前: ${ACTUAL_QDISC:-未知}，不属于可安全替换的简单队列）。"
+        ;;
+    esac
   fi
 }
 
@@ -1062,21 +1106,13 @@ run_diagnostic_buffer_test(){
 ##############################################################################
 
 score_candidate(){
-  # Fix-7: Use ratio-based scoring so both terms are dimensionless [0..N].
-  # tp_ratio = candidate_tp / baseline_tp  (higher is better)
-  # retr_quality = baseline_norm_retr / candidate_norm_retr, capped at 1.0.
-  #   Capping at 1.0 means "better retr than baseline" gives no bonus; only worse
-  #   retr gives demerits.  This prevents zero-retr candidates from overwhelming
-  #   the throughput component.
-  # score = tp_ratio * 0.7 + retr_quality * 0.3
-  # Baseline scores exactly 1.0 by definition.
-  #
-  # Fix-8: caller must compare CANDIDATE_SCORE against BASELINE_SCORE (1.0) and
-  #        require CANDIDATE_SCORE > BASELINE_SCORE * min_improvement_threshold.
-  #
-  # $1=throughput $2=retr $3=rtt_us $4=base_tp $5=base_retr $6=base_rtt $7=base_bytes
+  # $1=tp $2=retr $3=rtt_us $4=base_tp $5=base_retr $6=base_rtt $7=base_bytes $8=cand_bytes
+  # Issue-4 fix: cand_bytes is now passed explicitly (was using stale global IPERF_BYTES which
+  # could be overwritten by diagnostic tests run between baseline and candidate scoring).
+  # Baseline scores 1.0 by definition; a candidate must exceed 1.0 to be selected.
   local tp="$1" retr="$2" rtt_us="$3"
   local base_tp="$4" base_retr="$5" base_rtt_us="$6" base_bytes="$7"
+  local cand_bytes="${8:-${IPERF_BYTES:-1}}"  # explicit arg preferred; global as last resort
   CANDIDATE_SCORE=-1
   SCORE_REJECT_REASON=""
   local eps=0.001
@@ -1088,7 +1124,6 @@ score_candidate(){
   fi
 
   # Compute normalized retransmit rates per GB sent
-  local cand_bytes="${IPERF_BYTES:-1}"
   local norm_retr base_norm_retr
   norm_retr="$(awk "BEGIN{printf \"%.6f\", $retr / ($cand_bytes / 1073741824.0 + $eps)}")"
   base_norm_retr="$(awk "BEGIN{printf \"%.6f\", $base_retr / ($base_bytes / 1073741824.0 + $eps)}")"
@@ -1105,7 +1140,7 @@ score_candidate(){
     return 1
   fi
 
-  # Ratio-based score (Fix-7)
+  # Ratio-based score: baseline scores exactly 1.0 by definition.
   local tp_ratio safe_cand_norm safe_base_norm retr_quality
   tp_ratio="$(awk "BEGIN{printf \"%.6f\", ($base_tp > 0) ? $tp / $base_tp : 1}")"
   safe_cand_norm="$(awk "BEGIN{printf \"%.6f\", ($norm_retr > $eps) ? $norm_retr : $eps}")"
@@ -1131,6 +1166,7 @@ persist_final_atomic(){
     [ -n "$qdisc"    ] && printf 'net.core.default_qdisc = %s\n'          "$qdisc"
     [ -n "$wmem_max" ] && printf 'net.ipv4.tcp_wmem = 4096 16384 %s\n'    "$wmem_max"
     [ -n "$rmem_max" ] && printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n'    "$rmem_max"
+    true  # Issue-1 fix: ensure block exit code is 0 even when all optional params are empty
   } > "$tmpconf" || { rm -f "$tmpconf"; return 1; }
   mv "$tmpconf" "$CONF" || { rm -f "$tmpconf"; return 1; }
   if ! sysctl --system >/dev/null 2>&1; then
@@ -1839,7 +1875,8 @@ auto_tune_flow(){
   BASELINE_THROUGHPUT="$IPERF_THROUGHPUT"
   BASELINE_RETR="$IPERF_RETR"
   BASELINE_RTT="$IPERF_RTT"
-  BASELINE_BYTES="$(awk "BEGIN{printf \"%.0f\", $BASELINE_THROUGHPUT * 1000000 / 8 * $duration + 1}")"
+  # Issue-4 fix: use actual bytes reported by iperf3 (not an estimate from duration*rate)
+  BASELINE_BYTES="${IPERF_BYTES:-1}"
   printf '基线：吞吐 %s Mbps，Retr=%s，RTT=%s us\n' \
     "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT"
   session_log "baseline throughput=${BASELINE_THROUGHPUT}Mbps retr=$BASELINE_RETR rtt=${BASELINE_RTT}us"
@@ -1948,11 +1985,11 @@ auto_tune_flow(){
     _at_cleanup success; trap - INT TERM EXIT; pause; return
   fi
 
-  # 基线得分
+  # 基线得分（自评分 = 1.0 by definition; pass BASELINE_BYTES as cand_bytes $8）
   local baseline_score
   score_candidate "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" \
-    "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"
-  baseline_score="${CANDIDATE_SCORE:-0}"
+    "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES" "$BASELINE_BYTES"
+  baseline_score="${CANDIDATE_SCORE:-1.0}"
 
   # 候选筛选
   declare -a RES_SCORE RES_TP RES_RETR RES_RTT RES_STATUS
@@ -1985,8 +2022,9 @@ auto_tune_flow(){
     RES_RETR[$i]="$IPERF_RETR"
     RES_RTT[$i]="$IPERF_RTT"
 
+    # Issue-4 fix: pass IPERF_BYTES explicitly as $8 (cand_bytes)
     if score_candidate "${RES_TP[$i]}" "${RES_RETR[$i]}" "${RES_RTT[$i]}" \
-        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES" "$IPERF_BYTES"; then
       RES_SCORE[$i]="$CANDIDATE_SCORE"
       RES_STATUS[$i]="pass"
       printf '  吞吐: %s Mbps，Retr: %s，RTT: %s us，得分: %s\n' \
@@ -2031,12 +2069,14 @@ auto_tune_flow(){
   # Fix-11: use same parallelism (1) as screening; 4-stream naturally yields higher
   #         throughput and cannot be directly compared to single-stream baseline.
   if run_iperf3_json "$target" "$direction" "$((duration * 2))" 1; then
+    # Issue-4 fix: pass acceptance bytes explicitly; also require score > baseline (1.0)
     if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES"; then
+        "$BASELINE_THROUGHPUT" "$BASELINE_RETR" "$BASELINE_RTT" "$BASELINE_BYTES" "$IPERF_BYTES" \
+        && awk "BEGIN{exit !($CANDIDATE_SCORE > 1.0)}"; then
       green "验收通过：吞吐 $IPERF_THROUGHPUT Mbps，Retr=$IPERF_RETR，RTT=${IPERF_RTT}us，得分=$CANDIDATE_SCORE"
       final_ok=1
     else
-      red "验收未通过评分：$SCORE_REJECT_REASON"
+      red "验收未通过：${SCORE_REJECT_REASON:-得分 ${CANDIDATE_SCORE} 未高于基线 1.0}"
     fi
   else
     red "验收测试执行失败。"
@@ -2610,7 +2650,8 @@ remote_auto_tune_flow(){
       NODE_BL_TP[$_ni]="$IPERF_THROUGHPUT"
       NODE_BL_RETR[$_ni]="$IPERF_RETR"
       NODE_BL_RTT[$_ni]="$IPERF_RTT"
-      NODE_BL_BYTES[$_ni]="$(awk "BEGIN{printf \"%.0f\", $IPERF_THROUGHPUT * 1000000 / 8 * $duration + 1}")"
+      # Issue-4 fix: use actual IPERF_BYTES from the run, not an estimate
+      NODE_BL_BYTES[$_ni]="${IPERF_BYTES:-1}"
     else
       red "  节点 ${NODE_LABEL[$_ni]} 基线测试失败，标记为未知。"
       # Keep zeros — node will always fail scoring (round_ok=0)
@@ -2738,8 +2779,9 @@ remote_auto_tune_flow(){
         printf '  节点 %s 基线未知，跳过评分。\n' "${NODE_LABEL[$_ni]}"
         round_ok=0; continue
       fi
+      # Issue-4 fix: pass IPERF_BYTES explicitly as cand_bytes ($8)
       if score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-          "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}"; then
+          "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}" "$IPERF_BYTES"; then
         awk "BEGIN{exit !($CANDIDATE_SCORE < $worst_score)}" && worst_score="$CANDIDATE_SCORE"
       else
         printf '  节点 %s 拒绝：%s\n' "${NODE_LABEL[$_ni]}" "$SCORE_REJECT_REASON"
@@ -2789,14 +2831,16 @@ remote_auto_tune_flow(){
       red "节点 ${NODE_LABEL[$_ni]} 验收测试失败。"
       final_ok=0; continue
     fi
-    # Fix-9: score against each node's own baseline
+    # Fix-9 + Issue-4: score against this node's own baseline with explicit cand_bytes
     if [ "${NODE_BL_TP[$_ni]:-0}" -eq 0 ]; then
       red "节点 ${NODE_LABEL[$_ni]} 基线未知，验收失败。"
       final_ok=0; continue
     fi
+    # Issue-4 fix + require score > 1.0 to confirm genuine improvement
     if ! score_candidate "$IPERF_THROUGHPUT" "$IPERF_RETR" "$IPERF_RTT" \
-        "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}"; then
-      red "节点 ${NODE_LABEL[$_ni]} 验收未通过：$SCORE_REJECT_REASON"
+        "${NODE_BL_TP[$_ni]}" "${NODE_BL_RETR[$_ni]}" "${NODE_BL_RTT[$_ni]}" "${NODE_BL_BYTES[$_ni]}" "$IPERF_BYTES" \
+        || ! awk "BEGIN{exit !($CANDIDATE_SCORE <= 1.0)}"; then
+      red "节点 ${NODE_LABEL[$_ni]} 验收未通过：${SCORE_REJECT_REASON:-得分 ${CANDIDATE_SCORE} 未高于基线 1.0}"
       final_ok=0
     else
       printf '节点 %s 验收通过：%s Mbps，得分 %s\n' "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "$CANDIDATE_SCORE"
