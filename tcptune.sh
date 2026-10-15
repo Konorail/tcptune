@@ -763,6 +763,8 @@ AT_AUTO=0              # 1 when --auto-tune is active: disables all read/pause
 AT_TARGET=""           # iperf3 target host (set by --target or config)
 AT_DIRECTION="download" # test direction: download|upload
 AT_RETEST_ROUNDS=3     # interleaved re-test rounds for the winning candidate
+AT_PRIMARY_NODE=0      # index of primary node in SSH multi-node mode (0-based)
+AT_MAX_SHORTLIST=3     # max candidates forwarded from screening to interleaved retest
 BUDGET_USED_BYTES=0
 BASELINE_THROUGHPUT=0
 BASELINE_RETR=0
@@ -1186,6 +1188,12 @@ is_reliable_improvement(){
     return 1
   fi
 
+  # Degradation gate: RTT must not exceed AT_MAX_RTT_FACTOR% of baseline (checked before benefit)
+  if awk "BEGIN{exit !($cand_rtt > 0 && $base_rtt > 0 && $cand_rtt > $base_rtt * $AT_MAX_RTT_FACTOR / 100)}"; then
+    IMPROVEMENT_REASON="候选满载 RTT（${cand_rtt} us）超过基线（${base_rtt} us）的 ${AT_MAX_RTT_FACTOR}%，拒绝"
+    return 1
+  fi
+
   # Throughput improvement >= AT_MIN_TP_GAIN %
   local tp_gain_pct
   tp_gain_pct="$(awk "BEGIN{printf \"%.1f\", ($cand_tp/$base_tp - 1)*100}")"
@@ -1237,11 +1245,13 @@ interleaved_retest(){
   local base_tps="" base_rtts="" cand_tps="" cand_rtts=""
   local ok_rounds=0 fail_rounds=0 round
   for (( round=1; round<=AT_RETEST_ROUNDS; round++ )); do
+    local _pair_base_tp="" _pair_base_rtt=""
+    local _pair_cand_tp="" _pair_cand_rtt=""
     # --- baseline run ---
     session_restore_runtime
     if run_iperf3_json "$target" "$direction" "$duration" 1; then
-      base_tps="$base_tps $IPERF_THROUGHPUT"
-      base_rtts="$base_rtts $IPERF_RTT"
+      _pair_base_tp="$IPERF_THROUGHPUT"
+      _pair_base_rtt="$IPERF_RTT"
     else
       fail_rounds=$(( fail_rounds + 1 ))
       printf '  复测第 %d 轮基线测试失败。\n' "$round"
@@ -1252,14 +1262,23 @@ interleaved_retest(){
     [ -n "$cand_wmem" ] && apply_wmem "$cand_wmem"
     [ -n "$cand_rmem" ] && apply_rmem "$cand_rmem"
     if run_iperf3_json "$target" "$direction" "$duration" 1; then
-      cand_tps="$cand_tps $IPERF_THROUGHPUT"
-      cand_rtts="$cand_rtts $IPERF_RTT"
-      ok_rounds=$(( ok_rounds + 1 ))
-      printf '  复测第 %d 轮：基线 %s Mbps / 候选 %s Mbps\n' \
-        "$round" "$(printf '%s' "$base_tps" | awk '{print $NF}')" "$IPERF_THROUGHPUT"
+      _pair_cand_tp="$IPERF_THROUGHPUT"
+      _pair_cand_rtt="$IPERF_RTT"
     else
       fail_rounds=$(( fail_rounds + 1 ))
       printf '  复测第 %d 轮候选测试失败。\n' "$round"
+    fi
+    # Only count the pair if BOTH baseline AND candidate sides succeeded
+    if [ -n "$_pair_base_tp" ] && [ -n "$_pair_cand_tp" ]; then
+      base_tps="$base_tps $_pair_base_tp"
+      base_rtts="$base_rtts $_pair_base_rtt"
+      cand_tps="$cand_tps $_pair_cand_tp"
+      cand_rtts="$cand_rtts $_pair_cand_rtt"
+      ok_rounds=$(( ok_rounds + 1 ))
+      printf '  复测第 %d 轮：基线 %s Mbps / 候选 %s Mbps\n' \
+        "$round" "$_pair_base_tp" "$_pair_cand_tp"
+    else
+      printf '  复测第 %d 轮：对（baseline/candidate）不完整，不计入。\n' "$round"
     fi
   done
   # Restore to baseline after all rounds
@@ -1292,6 +1311,19 @@ persist_final_atomic(){
     [ -n "$qdisc"    ] && printf 'net.core.default_qdisc = %s\n'          "$qdisc"
     [ -n "$wmem_max" ] && printf 'net.ipv4.tcp_wmem = 4096 16384 %s\n'    "$wmem_max"
     [ -n "$rmem_max" ] && printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n'    "$rmem_max"
+    # Preserve prior managed entries not changed this session
+    if [ -f "$SESSION_DIR/orig_persistent.conf" ]; then
+      while IFS= read -r _pline; do
+        [[ "$_pline" =~ ^[[:space:]]*# ]] && continue
+        [[ "$_pline" =~ ^[[:space:]]*$ ]] && continue
+        case "$_pline" in
+          *tcp_congestion_control*) [ -z "$cc"       ] && printf '%s\n' "$_pline" ;;
+          *default_qdisc*)          [ -z "$qdisc"    ] && printf '%s\n' "$_pline" ;;
+          *tcp_wmem*)               [ -z "$wmem_max" ] && printf '%s\n' "$_pline" ;;
+          *tcp_rmem*)               [ -z "$rmem_max" ] && printf '%s\n' "$_pline" ;;
+        esac
+      done < "$SESSION_DIR/orig_persistent.conf"
+    fi
     true  # Issue-1 fix: ensure block exit code is 0 even when all optional params are empty
   } > "$tmpconf" || { rm -f "$tmpconf"; return 1; }
   mv "$tmpconf" "$CONF" || { rm -f "$tmpconf"; return 1; }
@@ -1310,6 +1342,16 @@ persist_final_atomic(){
   if [ -n "$qdisc" ]; then
     local actual; actual="$(sysctl_value net.core.default_qdisc)"
     [ "$actual" != "$qdisc" ] && { red "核对失败: default_qdisc 期望=$qdisc 实际=$actual"; ok=0; }
+  fi
+  if [ -n "$wmem_max" ]; then
+    local actual_wmem; actual_wmem="$(sysctl_value net.ipv4.tcp_wmem)"
+    local expected_wmem="4096 16384 ${wmem_max}"
+    [ "$actual_wmem" != "$expected_wmem" ] && { red "核对失败: tcp_wmem 期望=${expected_wmem} 实际=${actual_wmem}"; ok=0; }
+  fi
+  if [ -n "$rmem_max" ]; then
+    local actual_rmem; actual_rmem="$(sysctl_value net.ipv4.tcp_rmem)"
+    local expected_rmem="4096 87380 ${rmem_max}"
+    [ "$actual_rmem" != "$expected_rmem" ] && { red "核对失败: tcp_rmem 期望=${expected_rmem} 实际=${actual_rmem}"; ok=0; }
   fi
   if [ "$ok" -eq 0 ]; then
     red "读回核对失败，恢复原配置和运行状态..."
@@ -1358,8 +1400,6 @@ _finalize_and_persist(){
     return 1
   fi
 
-  # Delete the restore.sh only after confirming persist succeeded
-  rm -f "$SESSION_DIR/restore.sh"
   green "配置已持久化并通过读回核对。"
   printf 'RESULT=committed\n'
   return 0
@@ -1935,23 +1975,35 @@ auto_tune_flow(){
   echo
 
   # 环境检查
-  require_root || { pause; return; }
+  require_root || {
+    [ "$AT_AUTO" -eq 1 ] && { printf 'RESULT=failed\n'; return $AT_EXIT_FAILED; }
+    pause; return
+  }
   if [ -f "$MYSTERY_CONF" ]; then
     red "检测到已启用的迷之调参持久化配置：$MYSTERY_CONF"
     yellow "请先执行初始化恢复移除迷之调参配置，再使用自动调优流程。"
+    [ "$AT_AUTO" -eq 1 ] && { printf 'RESULT=failed\n'; return $AT_EXIT_FAILED; }
     pause; return
   fi
   for _cmd in sysctl awk iperf3 tc ip jq; do
     if ! has "$_cmd"; then
       red "缺少必要命令：$_cmd，请先运行"环境检查 / 安装依赖"。"
+      [ "$AT_AUTO" -eq 1 ] && { printf 'RESULT=failed\n'; return $AT_EXIT_FAILED; }
       pause; return
     fi
   done
 
   # 进程锁
-  lock_acquire || { pause; return; }
+  lock_acquire || {
+    [ "$AT_AUTO" -eq 1 ] && { printf 'RESULT=failed\n'; return $AT_EXIT_FAILED; }
+    pause; return
+  }
   # 会话快照
-  session_create || { lock_release; red "无法创建会话快照，取消调优。"; pause; return; }
+  session_create || {
+    lock_release; red "无法创建会话快照，取消调优。"
+    [ "$AT_AUTO" -eq 1 ] && { printf 'RESULT=failed\n'; return $AT_EXIT_FAILED; }
+    pause; return
+  }
 
   # 设置 trap
   trap '_at_cleanup interrupted' INT TERM
@@ -2043,7 +2095,10 @@ auto_tune_flow(){
   if ! run_iperf3_json "$target" "$direction" "$duration" 1; then
     red "基线测试失败，无法继续。"
     [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
-    _at_cleanup failed; trap - INT TERM EXIT; pause; return
+    _at_cleanup failed; trap - INT TERM EXIT
+    printf 'RESULT=failed\n'
+    [ "$AT_AUTO" -eq 1 ] && return $AT_EXIT_FAILED
+    pause; return
   fi
   BASELINE_THROUGHPUT="$IPERF_THROUGHPUT"
   BASELINE_RETR="$IPERF_RETR"
@@ -2155,7 +2210,10 @@ auto_tune_flow(){
   if [ "$cand_count" -eq 0 ]; then
     green "未生成任何候选（当前配置已是可用选项中最优），无需变更。"
     [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
-    _at_cleanup success; trap - INT TERM EXIT; pause; return
+    _at_cleanup success; trap - INT TERM EXIT
+    printf 'RESULT=no_change\n'
+    [ "$AT_AUTO" -eq 1 ] && return $AT_EXIT_NO_CHANGE
+    pause; return
   fi
 
   # 基线得分（自评分 = 1.0 by definition; pass BASELINE_BYTES as cand_bytes $8）
@@ -2167,6 +2225,7 @@ auto_tune_flow(){
   # 候选筛选
   declare -a RES_SCORE RES_TP RES_RETR RES_RTT RES_STATUS
   local best_idx=-1 best_score_val="-1"
+  local pass_idxs=""  # space-separated list of passing candidate indices (sorted by score desc)
 
   echo
   green "--- 候选筛选（预算 60% = $(( screen_budget / 1024 / 1024 )) MiB）---"
@@ -2179,11 +2238,17 @@ auto_tune_flow(){
 
     yellow "候选 $((i+1))/$cand_count：${CAND_LABEL[$i]}"
 
-    # 应用候选
-    apply_cc "${CAND_CC[$i]}"
-    apply_qdisc "${CAND_QDISC[$i]}"
-    [ -n "${CAND_WMEM[$i]}" ] && apply_wmem "${CAND_WMEM[$i]}"
-    [ -n "${CAND_RMEM[$i]}" ] && apply_rmem "${CAND_RMEM[$i]}"
+    # 应用候选；任一步骤失败则跳过测试，不参与排名
+    local _apply_ok=1
+    apply_cc "${CAND_CC[$i]}"    || _apply_ok=0
+    apply_qdisc "${CAND_QDISC[$i]}" || _apply_ok=0
+    { [ -n "${CAND_WMEM[$i]}" ] && apply_wmem "${CAND_WMEM[$i]}"; } || true
+    { [ -n "${CAND_RMEM[$i]}" ] && apply_rmem "${CAND_RMEM[$i]}"; } || true
+    if [ "$_apply_ok" -eq 0 ]; then
+      red "  应用失败，跳过此候选（不参与排名）。"
+      RES_STATUS[$i]="invalid"; RES_SCORE[$i]=-1
+      session_restore_runtime; continue
+    fi
 
     if ! run_iperf3_json "$target" "$direction" "$duration" 1; then
       red "  测试失败，跳过此候选。"
@@ -2202,10 +2267,41 @@ auto_tune_flow(){
       RES_STATUS[$i]="pass"
       printf '  吞吐: %s Mbps，Retr: %s，RTT: %s us，得分: %s\n' \
         "${RES_TP[$i]}" "${RES_RETR[$i]}" "${RES_RTT[$i]}" "$CANDIDATE_SCORE"
-      # Fix-8: candidate must beat baseline_score; use 5% margin between candidates
-      if awk "BEGIN{exit !($CANDIDATE_SCORE > $baseline_score && ($CANDIDATE_SCORE > ${best_score_val} * 1.05 || $best_idx == -1))}"; then
-        best_score_val="$CANDIDATE_SCORE"
-        best_idx="$i"
+      # Pass criterion 1: score > baseline (tp-led improvement)
+      local _cand_qualifies=0
+      if awk "BEGIN{exit !($CANDIDATE_SCORE > $baseline_score)}"; then
+        _cand_qualifies=1
+      fi
+      # Pass criterion 2: RTT-led improvement (latency drops ≥ AT_MIN_RTT_GAIN% with tp ≥ 95%)
+      # Allows candidates with great RTT reduction but no tp gain to enter retest
+      if [ "$_cand_qualifies" -eq 0 ] && \
+          awk "BEGIN{exit !($BASELINE_RTT > 0 && ${RES_RTT[$i]:-0} > 0 && \
+            ${RES_RTT[$i]:-0} < $BASELINE_RTT && \
+            (1 - ${RES_RTT[$i]:-0}/$BASELINE_RTT)*100 >= $AT_MIN_RTT_GAIN && \
+            ${RES_TP[$i]:-0} >= $BASELINE_THROUGHPUT * 0.95)}"; then
+        _cand_qualifies=1
+        RES_STATUS[$i]="pass_rtt"
+        printf '  RTT 候选（改善 ≥%s%%，吞吐持平）\n' "$AT_MIN_RTT_GAIN"
+      fi
+      if [ "$_cand_qualifies" -eq 1 ]; then
+        # Insert into pass_idxs in descending score order (simple insertion)
+        local _new_entry="$i" _sorted="" _pos _sidx
+        local _inserted=0
+        for _sidx in $pass_idxs; do
+          if [ "$_inserted" -eq 0 ] && awk "BEGIN{exit !(${RES_SCORE[$i]} > ${RES_SCORE[$_sidx]})}"; then
+            _sorted="$_sorted $_new_entry $_sidx"
+            _inserted=1
+          else
+            _sorted="$_sorted $_sidx"
+          fi
+        done
+        [ "$_inserted" -eq 0 ] && _sorted="$_sorted $_new_entry"
+        pass_idxs="${_sorted# }"
+        # Keep best_idx as the single top candidate for backward compat display
+        if awk "BEGIN{exit !(${RES_SCORE[$i]} > ${best_score_val})}"; then
+          best_score_val="${RES_SCORE[$i]}"
+          best_idx="$i"
+        fi
       fi
     else
       RES_SCORE[$i]=-1
@@ -2221,7 +2317,7 @@ auto_tune_flow(){
     session_restore_runtime
   done
 
-  if [ "$best_idx" -eq -1 ]; then
+  if [ "$best_idx" -eq -1 ] && [ -z "$pass_idxs" ]; then
     yellow "所有候选均未通过筛选，保留当前配置。"
     [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
     _at_cleanup success_no_change; trap - INT TERM EXIT
@@ -2230,28 +2326,54 @@ auto_tune_flow(){
     pause; return
   fi
 
-  green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
-  session_log "best_candidate=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]}"
+  # 取短名单前 AT_MAX_SHORTLIST 个候选进入交错复测
+  local shortlist=""
+  local _sc=0
+  for _sidx in $pass_idxs; do
+    [ "$_sc" -ge "$AT_MAX_SHORTLIST" ] && break
+    shortlist="$shortlist $_sidx"
+    _sc=$(( _sc + 1 ))
+  done
+  shortlist="${shortlist# }"
+  # If best_idx is -1 (only RTT-improvement candidates), use the first shortlist entry
+  [ "$best_idx" -eq -1 ] && best_idx="${shortlist%% *}"
+  printf '进入复测候选（前 %d）：' "$_sc"
+  for _sidx in $shortlist; do printf ' %s' "${CAND_LABEL[$_sidx]}"; done; echo
 
-  # ── 交错复测（对筛选胜者做 AT_RETEST_ROUNDS 轮交替测试，使用中位数判断）──
+  green "筛选最佳候选：${CAND_LABEL[$best_idx]}（得分 ${RES_SCORE[$best_idx]}）"
+  session_log "best_candidate=${CAND_LABEL[$best_idx]} score=${RES_SCORE[$best_idx]} shortlist_count=$_sc"
+
+  # ── 交错复测（对短名单候选依次尝试 AT_RETEST_ROUNDS 轮，取首个通过者）──
   echo
-  green "--- 交错复测（${AT_RETEST_ROUNDS} 轮）---"
-  local retest_ok=0
-  if interleaved_retest "$target" "$direction" "$duration" \
-      "${CAND_CC[$best_idx]}" "${CAND_QDISC[$best_idx]}" \
-      "${CAND_WMEM[$best_idx]:-}" "${CAND_RMEM[$best_idx]:-}"; then
-    if is_reliable_improvement \
-        "$RETEST_CAND_TP_MEDIAN" "$RETEST_BASE_TP_MEDIAN" \
-        "$RETEST_CAND_RTT_MEDIAN" "$RETEST_BASE_RTT_MEDIAN"; then
-      green "交错复测确认可靠改善：$IMPROVEMENT_REASON"
-      retest_ok=1
-    else
-      yellow "交错复测未确认可靠改善：$IMPROVEMENT_REASON"
+  green "--- 交错复测（${AT_RETEST_ROUNDS} 轮，预算 40% = $(( (budget_bytes - screen_budget) / 1024 / 1024 )) MiB）---"
+  local retest_ok=0 winner_idx=-1
+  for _sidx in $shortlist; do
+    # Budget check before each retest attempt
+    if [ "$BUDGET_USED_BYTES" -gt "$budget_bytes" ]; then
+      yellow "复测预算已用完，停止尝试剩余候选。"
+      break
     fi
-  else
-    red "交错复测失败（测试轮次不足）。"
-  fi
-  session_log "retest_ok=$retest_ok"
+    printf '尝试复测候选：%s\n' "${CAND_LABEL[$_sidx]}"
+    if interleaved_retest "$target" "$direction" "$duration" \
+        "${CAND_CC[$_sidx]}" "${CAND_QDISC[$_sidx]}" \
+        "${CAND_WMEM[$_sidx]:-}" "${CAND_RMEM[$_sidx]:-}"; then
+      if is_reliable_improvement \
+          "$RETEST_CAND_TP_MEDIAN" "$RETEST_BASE_TP_MEDIAN" \
+          "$RETEST_CAND_RTT_MEDIAN" "$RETEST_BASE_RTT_MEDIAN"; then
+        green "交错复测确认可靠改善：$IMPROVEMENT_REASON"
+        retest_ok=1
+        winner_idx="$_sidx"
+        break
+      else
+        yellow "候选 ${CAND_LABEL[$_sidx]} 复测未确认改善：$IMPROVEMENT_REASON"
+      fi
+    else
+      red "候选 ${CAND_LABEL[$_sidx]} 复测失败（测试轮次不足）。"
+    fi
+  done
+  # Use best_idx for display backward compat; winner_idx for commit
+  [ "$winner_idx" -ge 0 ] && best_idx="$winner_idx"
+  session_log "retest_ok=$retest_ok winner_idx=$winner_idx"
 
   [ -n "$_local_server_pid" ] && kill "$_local_server_pid" 2>/dev/null || true
 
@@ -3018,7 +3140,7 @@ remote_auto_tune_flow(){
         "${NODE_BL_BYTES[$_ni]}" "$IPERF_BYTES" \
         && awk "BEGIN{exit !($CANDIDATE_SCORE > 1.0)}"; then
       printf '节点 %s 验收通过：%s Mbps，得分 %s\n' "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "$CANDIDATE_SCORE"
-      [ "$_ni" -eq 0 ] && primary_improved=1
+      [ "$_ni" -eq "$AT_PRIMARY_NODE" ] && primary_improved=1
     else
       # Allow non-primary node to stay within 5% of baseline (no regression)
       local _no_regression
@@ -3028,7 +3150,7 @@ remote_auto_tune_flow(){
           "${NODE_LABEL[$_ni]}" "$IPERF_THROUGHPUT" "${NODE_BL_TP[$_ni]}"
       else
         red "节点 ${NODE_LABEL[$_ni]} 验收未通过：${SCORE_REJECT_REASON:-得分 ${CANDIDATE_SCORE:-?} 未高于基线 1.0}"
-        [ "$_ni" -eq 0 ] && final_ok=0  # primary node failure is fatal
+        [ "$_ni" -eq "$AT_PRIMARY_NODE" ] && final_ok=0  # primary node failure is fatal
       fi
     fi
   done
@@ -3244,6 +3366,9 @@ _parse_cli_args(){
       --retest-rounds)
         AT_RETEST_ROUNDS="${2:?--retest-rounds 需要整数参数}"
         shift 2 ;;
+      --primary-node)
+        AT_PRIMARY_NODE="${2:?--primary-node 需要整数参数（0-based 节点索引）}"
+        shift 2 ;;
       --auto-tune)
         AT_AUTO=1
         _run_auto=1
@@ -3257,6 +3382,7 @@ _parse_cli_args(){
         printf '  --duration N         每轮测试时长秒（默认 %s）\n' "$AT_DURATION"
         printf '  --budget-gib N       总流量预算 GiB（默认 %s）\n' "$AT_BUDGET_GIB"
         printf '  --retest-rounds N    交错复测轮数（默认 %s）\n' "$AT_RETEST_ROUNDS"
+        printf '  --primary-node N     SSH 多节点模式主节点索引（0-based，默认 %s）\n' "$AT_PRIMARY_NODE"
         printf '\n代理验收（环境变量或 shell 导出）:\n'
         printf '  PROXY_HOST=<ip>      SOCKS5 代理 IP\n'
         printf '  PROXY_PORT=<port>    SOCKS5 端口（默认 1080）\n'
