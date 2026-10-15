@@ -2071,6 +2071,7 @@ _buffer_candidates(){
 }
 
 _auto_main(){
+  RUN_REASON=internal_error
   local cmd baseline candidate cc idx rc best_screen_cc score qualified
   local current_cc available_cc
   _validate_auto_options || { RUN_REASON=invalid_options; return 1; }
@@ -2219,7 +2220,15 @@ _at_cleanup(){
       fi
       _write_report || red '无法保存报告，请检查磁盘和会话目录。'
     fi
-    if [ "$restored" -eq 0 ]; then touch "$SESSION_DIR/complete" || rc=1; fi
+    if [ "$restored" -eq 0 ] && ! touch "$SESSION_DIR/complete"; then
+      RUN_RESULT=failed; RUN_REASON=completion_marker_failed; rc=1
+      if [ "$RUN_COMMITTED" -eq 1 ]; then
+        RUN_COMMITTED=0
+        if _restore_orig_persistent && session_restore_runtime; then RUN_RESTORE_VERIFIED=true
+        else RUN_RESTORE_VERIFIED=false; restored=1; fi
+      fi
+      _write_report || red '无法更新失败报告；会话未标记完成，请检查恢复状态。'
+    fi
     session_log "result=$RUN_RESULT reason=$RUN_REASON restore_verified=$RUN_RESTORE_VERIFIED"
     if [ -f "$SESSION_DIR/report.json" ]; then printf 'REPORT=%s/report.json\n' "$SESSION_DIR"
     else printf 'SESSION=%s\n' "$SESSION_DIR"; fi

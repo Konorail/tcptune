@@ -237,6 +237,18 @@ proxy_service_failure(){
   assert_json 'listener failure reason recorded' "$REPORT" '[.decisions[].reason]|index("proxy_service_restart_failed")!=null'
 }
 
+completion_failure(){
+  setup_mock
+  touch(){
+    case "$1" in */complete) return 1 ;; *) command touch "$@" ;; esac
+  }
+  run_mock_auto
+  assert_eq 'completion marker failure does not acknowledge commit' 1 "$AUTO_RC"
+  assert_json 'completion failure reports actual rollback' "$REPORT" '.result=="failed" and .reason=="completion_marker_failed" and (.persisted|not) and .restore_verified'
+  assert_eq 'completion failure restores runtime' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  assert_ok 'completion failure restores old config' cmp -s "$CONF" "$CASE_TMP/original.conf"
+}
+
 run_case committed committed
 run_case no-persist temporary
 run_case negligible-gain unchanged
@@ -264,4 +276,5 @@ run_case signal-rollback interrupted
 run_case report-failure report_failure
 run_case proxy-service-refresh proxy_service
 run_case proxy-service-failure proxy_service_failure
+run_case completion-marker-failure completion_failure
 finish_suite
