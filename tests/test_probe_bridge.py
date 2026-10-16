@@ -43,7 +43,7 @@ class BridgeTests(unittest.TestCase):
             while True:
                 try:
                     state = status.read_text().rsplit(")", 1)[1].split()[0]
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     return
                 if state == "Z":
                     return
