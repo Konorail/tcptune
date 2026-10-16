@@ -18,7 +18,7 @@ XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 MIB=$((1024 * 1024))
 MIN_WINDOW=87380
 SSH_CONNECT_TIMEOUT=8
-SCRIPT_VERSION="v2.2.0"
+SCRIPT_VERSION="v2.3.0"
 SCRIPT_DATE="2026-10-16"
 
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
@@ -528,12 +528,31 @@ remove_xanmod_component(){
   fi
 }
 
-reset_to_initial_state(){
+restore_baseline(){
+  local previous rc=0
+  clear_screen
+  require_root || { pause; return 1; }
+  previous="$(cat "$STATE_DIR/active-session" 2>/dev/null)" || previous=""
+  case "$previous" in
+    "$SESSIONS_BASE"/*)
+      if [ -f "$previous/restore.sh" ]; then
+        # The frozen script takes the same lock and rejects obsolete sessions.
+        bash "$previous/restore.sh" || rc=$?
+      else red "最近会话缺少恢复脚本：$previous"; rc=1; fi ;;
+    *) red '没有可恢复的自动调优会话。'; rc=1 ;;
+  esac
+  pause
+  return "$rc"
+}
+
+reset_to_initial_state() (
   local yn reset_ok=1
+  LOCK_HELD=0
+  trap 'lock_release' EXIT
   clear_screen
   green "一键卸载附加组件并恢复初始化状态"
   echo "将执行以下操作："
-  echo "- 使用已保存的调优前基线恢复 TCP / qdisc 参数（若存在）"
+  echo "- 恢复最近自动调优会话，以及已保存的旧版参数基线（若存在）"
   echo "- 删除本脚本写入的交互调优 / 迷之调参持久化配置和测试记录"
   echo "- 卸载 sshpass（不卸载 iperf3、speedtest、LibreSpeed 等基础/测速工具）"
   echo "- 卸载未在运行中的 XanMod 内核包，并移除 XanMod 软件源"
@@ -542,7 +561,21 @@ reset_to_initial_state(){
   read -rp "确认执行初始化清理？[y/N]: " yn
   [[ "$yn" =~ ^[Yy]$ ]] || { yellow "已取消。"; pause; return; }
   require_root || { pause; return; }
+  has flock || { red '缺少 flock，无法安全执行恢复和清理。'; pause; return 1; }
+  lock_acquire || { pause; return 1; }
   echo
+
+  if [ -s "$STATE_DIR/active-session" ]; then
+    local previous
+    previous="$(cat "$STATE_DIR/active-session")" || return 1
+    case "$previous" in
+      "$SESSIONS_BASE"/*)
+        [ -f "$previous/restore.sh" ] || { red '缺少最近会话恢复脚本，已停止清理。'; pause; return 1; }
+        # We already own FD 9 and checked the current session while acquiring it.
+        bash "$previous/restore.sh" --watchdog || { red '最近会话恢复失败，已停止清理。'; pause; return 1; } ;;
+      *) red '最近会话路径无效，已停止清理。'; pause; return 1 ;;
+    esac
+  fi
 
   if [ -f "$MYSTERY_BASELINE" ]; then
     green "正在恢复迷之调参应用前保存的网络参数基线..."
@@ -589,7 +622,7 @@ reset_to_initial_state(){
     yellow "初始化清理部分完成，请根据上方提示处理保留项目。"
   fi
   pause
-}
+)
 
 install_optional_speed_tool(){
   local tool="$1"
@@ -814,6 +847,11 @@ RUN_PERSIST_TOUCHED=0
 RUN_START=0
 RUN_FINISHED=0
 RETEST_STATS='{}'
+RETEST_RESULTS='[]'
+ACCEPTANCE_STATS=null
+ACCEPTANCE_ATTEMPTED=false
+ACCEPTANCE_COMPLETED=false
+ACCEPTANCE_PASSED=false
 RETEST_STAGE=retest
 RETEST_GATE_FAILED=0
 RETEST_VALID_PAIRS=0
@@ -829,7 +867,7 @@ session_log(){ [ -z "$SESSION_DIR" ] || printf '%s %s\n' "$(date -u +%FT%TZ)" "$
 
 check_actual_qdisc(){
   # Resolve the tested path, including policy routing; never guess first default.
-  local route
+  local route queues
   local route_target="${AT_TARGET:-1.1.1.1}"
   if [[ ! "$route_target" =~ ^[0-9.:]+$ ]]; then
     route_target="$(getent ahosts "$route_target" 2>/dev/null | awk 'NR==1{print $1}')"
@@ -838,7 +876,13 @@ check_actual_qdisc(){
   route="$(ip route get "$route_target" 2>/dev/null)" || return 1
   ACTUAL_IFACE="$(awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}' <<< "$route")"
   [ -n "$ACTUAL_IFACE" ] || return 1
-  ACTUAL_QDISC="$(tc qdisc show dev "$ACTUAL_IFACE" 2>/dev/null | awk '/ root /{print $2;exit}')"
+  queues="$(tc -j qdisc show dev "$ACTUAL_IFACE" 2>/dev/null)" || return 1
+  ACTUAL_QDISC="$(jq -ser '
+    select(length==1) | .[0] |
+    select(type=="array" and length>0 and all(.[];type=="object")) |
+    [.[]|select(.root==true)|.kind] |
+    select(length==1 and (.[0]|type)=="string" and (.[0]|length)>0) | .[0]
+  ' <<< "$queues")" || return 1
 }
 
 _runtime_json(){
@@ -903,11 +947,14 @@ session_restore_runtime(){
     [ "$(normalize_value "$(sysctl_value "$key")")" = "$(normalize_value "$val")" ] || ok=1
   done < "$snap"
   # Automatic mode never mutates tc. Verify original queue configuration survived.
-  if [ -s "$SESSION_DIR/qdisc.json" ]; then
-    local current
-    current="$(tc -j qdisc show dev "$ACTUAL_IFACE" 2>/dev/null | jq -Sc .)" || return 1
-    [ "$current" = "$(cat "$SESSION_DIR/qdisc.json")" ] || ok=1
-  fi
+  local current original
+  # Capture tc's own status; neither caller pipefail nor jq's empty-input status
+  # can turn a failed/missing queue read into verified restoration.
+  if current="$(tc -j qdisc show dev "$ACTUAL_IFACE" 2>/dev/null)" &&
+    current="$(jq -Sce -s 'select(length==1)|.[0]|select(type=="array" and length>0 and all(.[];type=="object"))' <<< "$current")" &&
+    original="$(jq -Sce -s 'select(length==1)|.[0]|select(type=="array" and length>0 and all(.[];type=="object"))' "$SESSION_DIR/qdisc.json")"; then
+    [ "$current" = "$original" ] || ok=1
+  else ok=1; fi
   if [ -n "${AT_PROXY_SERVICE:-}" ] && { [ "$cc_changed" -eq 1 ] || [ -f "$SESSION_DIR/service-dirty" ]; }; then
     _restart_proxy_service || ok=1
   fi
@@ -923,7 +970,7 @@ _restart_proxy_service(){
 }
 
 session_create(){
-  local key value
+  local key value queues
   mkdir -p "$SESSIONS_BASE" || return 1
   SESSION_DIR="$(mktemp -d "$SESSIONS_BASE/$(date -u +%Y%m%d-%H%M%S).XXXXXX")" || return 1
   : > "$SESSION_DIR/snapshot.conf"
@@ -937,7 +984,9 @@ session_create(){
     printf '%s = %s\n' "$key" "$value" >> "$SESSION_DIR/snapshot.conf" || return 1
   done
   _runtime_json > "$SESSION_DIR/original.json" || return 1
-  tc -j qdisc show dev "$ACTUAL_IFACE" 2>/dev/null | jq -Sce . > "$SESSION_DIR/qdisc.json" || return 1
+  queues="$(tc -j qdisc show dev "$ACTUAL_IFACE" 2>/dev/null)" || return 1
+  jq -Sce -s 'select(length==1)|.[0]|select(type=="array" and length>0 and all(.[];type=="object"))' \
+    <<< "$queues" > "$SESSION_DIR/qdisc.json" || return 1
   if [ -f "$CONF" ]; then
     cp -p "$CONF" "$SESSION_DIR/orig_persistent.conf" || return 1
     printf 'exists\n' > "$SESSION_DIR/orig_persistent.status"
@@ -958,12 +1007,21 @@ if [ "${1:-}" != --watchdog ]; then
     echo 'A newer session owns this machine; use its restore script.' >&2; exit 1
   fi
 fi
+# A previously completed commit is no longer verified once recovery starts.
+# Invalidate its marker before writes so a failed retry blocks new tuning.
+if ! rm -f "$SESSION_DIR/complete" || [ -e "$SESSION_DIR/complete" ] || [ -L "$SESSION_DIR/complete" ]; then
+  echo 'restore_attempted=false; reason=completion_marker_remove_failed; recovery not started' >&2
+  exit 1
+fi
 rc=0
 _restore_orig_persistent || rc=1
 session_restore_runtime || rc=1
 if [ "$rc" -eq 0 ]; then
-  touch "$SESSION_DIR/complete"
   echo 'restore_verified=true'
+  if ! touch "$SESSION_DIR/complete"; then
+    echo 'session_complete=false; reason=completion_marker_failed; parameters restored, retry recovery after fixing session storage' >&2
+    rc=1
+  fi
 else echo 'restore_verified=false; manual recovery required' >&2; fi
 exit "$rc"
 RESTORE
@@ -1066,7 +1124,7 @@ run_iperf3_json(){
   local target="$1" direction="$2" duration="$3" parallel="${4:-1}"
   local remaining reservation probe_reserve=0 started raw probe_file rc probe_rc=0 pid sampler=""
   local resources_before resources_after socket_file sndbuf_pct
-  local sample_limit=0 accounted_bytes mode=timed
+  local sample_limit=0 accounted_bytes mode=timed probe_parsed=""
   IPERF_THROUGHPUT=0; IPERF_RETR=null; IPERF_RTT=null; IPERF_BYTES=0
   IPERF_SNDBUF_LIMITED=0; IPERF_RWND_LIMITED=0
   IPERF_SNDBUF_EVIDENCE=0
@@ -1124,7 +1182,8 @@ run_iperf3_json(){
   fi
   local parsed='{}' status=failed actual='{}'
   if [ "$rc" -eq 0 ]; then
-    parsed="$(jq -ce '
+    parsed="$(jq -cse '
+       if length==1 and (.[0]|type)=="object" then .[0] else error("expected one iperf object") end |
       if .error then error(.error) else . end |
       (.end.sum_received // .end.sum) as $recv |
       (.server_output_json // {}) as $server |
@@ -1142,7 +1201,8 @@ run_iperf3_json(){
         (.accounted_bytes|floor)==.accounted_bytes and .accounted_bytes<=9007199254740991 and
         (.retr==null or ((.retr|type)=="number" and .retr>=0 and (.retr|floor)==.retr)))
     ' "$raw" 2>/dev/null)" || parsed='{}'
-    if jq -e '.tp>0 and .bytes>0' <<< "$parsed" >/dev/null; then
+    [ -n "$parsed" ] || parsed='{}'
+    if [ -n "$parsed" ] && jq -e '.tp>0 and .bytes>0' <<< "$parsed" >/dev/null; then
       read -r IPERF_THROUGHPUT IPERF_BYTES IPERF_RETR IPERF_RTT IPERF_SNDBUF_LIMITED IPERF_RWND_LIMITED < <(jq -r '[.tp,.bytes,.retr,.rtt,.sndbuf,.rwnd]|map(if .==null then "null" else tostring end)|@tsv' <<< "$parsed")
       accounted_bytes="$(jq -r .accounted_bytes <<< "$parsed")"
       BUDGET_USED_BYTES=$(( BUDGET_USED_BYTES - reservation + accounted_bytes ))
@@ -1157,16 +1217,18 @@ run_iperf3_json(){
     fi
   fi
   if [ -n "$AT_PROBE_COMMAND" ]; then
-    if [ "$probe_rc" -eq 0 ] && jq -e --argjson limit "$probe_reserve" '
+    if [ "$probe_rc" -eq 0 ] && probe_parsed="$(jq -cse --argjson limit "$probe_reserve" '
+       if length==1 and (.[0]|type)=="object" then .[0] else error("expected one probe object") end |
+       select(
       .status=="ok" and (.requests|type)=="number" and .requests>=10 and (.requests|floor)==.requests and
       (.errors|type)=="number" and .errors>=0 and .errors<=.requests and (.errors|floor)==.errors and
       (.p50_ms|type)=="number" and .p50_ms>0 and
       (.p95_ms|type)=="number" and .p95_ms>=.p50_ms and
       (.download_mbps|type)=="number" and .download_mbps>0 and
-      (.bytes|type)=="number" and .bytes>0 and .bytes<=$limit and (.bytes|floor)==.bytes
-    ' "$probe_file" >/dev/null 2>&1; then
-      IPERF_PROXY="$(jq -c . "$probe_file")"
-      BUDGET_USED_BYTES=$(( BUDGET_USED_BYTES - probe_reserve + $(jq -r .bytes "$probe_file") ))
+       (.bytes|type)=="number" and .bytes>0 and .bytes<=$limit and (.bytes|floor)==.bytes)
+    ' "$probe_file" 2>/dev/null)" && [ -n "$probe_parsed" ]; then
+      IPERF_PROXY="$probe_parsed"
+      BUDGET_USED_BYTES=$(( BUDGET_USED_BYTES - probe_reserve + $(jq -r .bytes <<< "$probe_parsed") ))
     else IPERF_PROXY='{"status":"failed"}'; status=failed; MEASURE_REASON=proxy_measurement_failed; fi
   fi
   if [ "$BUDGET_USED_BYTES" -gt "$BUDGET_LIMIT_BYTES" ]; then status=failed; MEASURE_REASON=traffic_budget_exceeded; fi
@@ -1264,6 +1326,8 @@ _pair_statistics(){
       latency_relative_mad:(if ($lb|length)>0 then 100*($lb|mad)/($lb|median) else null end),
       base_tp:($b|median),cand_tp:([$p[].candidate|throughput]|median),
       throughput_metric:(if $p[0].baseline.proxy.status=="ok" then "proxy_download_mbps" else "iperf_mbps" end),
+      latency_metric:(if $p[0].baseline.proxy.status=="ok" then "proxy_p95_us" else "tcp_mean_rtt_us" end),
+      base_latency:($lb|median),cand_latency:([$p[].candidate|latency|select(.>0)]|median),
       base_rtt:([$p[].baseline.rtt|select(.!=null and .>0)]|median),
       cand_rtt:([$p[].candidate.rtt|select(.!=null and .>0)]|median)} |
     .tp_threshold=([$min_tp,2*(.baseline_relative_mad//0)]|max) |
@@ -1373,10 +1437,16 @@ _finalize_and_persist(){
 }
 
 _write_report(){
-  local tmp actual='{}' version policy
+  local tmp actual='{}' version policy script_hash=unknown hash_output
   tmp="$SESSION_DIR/report.json.tmp"
   actual="$(_runtime_json)" || return 1
   version="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse HEAD 2>/dev/null || printf unknown)"
+  # A process substitution is a consumed stream, not a hashable source file.
+  if [ -f "${BASH_SOURCE[0]}" ]; then
+    hash_output="$(sha256sum -- "${BASH_SOURCE[0]}")" || return 1
+    script_hash="${hash_output%% *}"
+    [[ "$script_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
+  fi
   policy="$(jq -cn --argjson tp "$AT_MIN_TP_GAIN" --argjson latency "$AT_MIN_RTT_GAIN" \
     --argjson factor "$AT_MAX_RTT_FACTOR" --argjson absolute "$AT_RTT_TOLERANCE_MS" \
     --argjson retr "$AT_MAX_RETR_FACTOR" --argjson floor "$AT_RETR_FLOOR" \
@@ -1386,27 +1456,32 @@ _write_report(){
       max_retransmit_factor_pct:$retr,retransmit_floor_per_gib:$floor,retest_pairs:$rounds,acceptance_pairs:$accept,
       max_seconds:$seconds,measurement_seconds:$duration,direction_consistency:0.8}')" || return 1
   jq -n --arg result "$RUN_RESULT" --arg reason "$RUN_REASON" --arg version "$SCRIPT_VERSION" --arg commit "$version" \
-    --arg kernel "$(uname -r)" --arg iperf_version "$(iperf3 --version 2>/dev/null | head -n1)" \
+    --arg kernel "$(uname -r)" --arg iperf_version "$(iperf3 --version 2>/dev/null | head -n1)" --arg script_hash "$script_hash" \
     --arg target "$AT_TARGET" --arg direction "$AT_DIRECTION" --arg iface "$ACTUAL_IFACE" \
     --argjson selected "$RUN_SELECTED" --argjson persisted "$([ "$RUN_COMMITTED" -eq 1 ] && echo true || echo false)" \
     --argjson restored "$RUN_RESTORE_VERIFIED" --argjson used "$BUDGET_USED_BYTES" --argjson limit "$BUDGET_LIMIT_BYTES" \
     --argjson rate "$AT_RATE_MBPS" --argjson sample_mib "$AT_SAMPLE_MIB" --argjson started "$RUN_START" --argjson ended "$(date +%s)" \
-    --argjson actual "$actual" --argjson stats "$RETEST_STATS" --argjson policy "$policy" \
+    --argjson actual "$actual" --argjson retests "$RETEST_RESULTS" --argjson acceptance "$ACCEPTANCE_STATS" --argjson policy "$policy" \
+    --argjson acceptance_attempted "$ACCEPTANCE_ATTEMPTED" --argjson acceptance_completed "$ACCEPTANCE_COMPLETED" --argjson acceptance_passed "$ACCEPTANCE_PASSED" \
     --argjson request "${WINNER_CONFIG:-null}" --arg probe "$AT_PROBE_COMMAND" --arg service "$AT_PROXY_SERVICE" \
     --slurpfile original "$SESSION_DIR/original.json" --slurpfile measurements "$SESSION_DIR/measurements.jsonl" \
     --slurpfile pairs "$SESSION_DIR/pairs.jsonl" \
     --slurpfile candidates "$SESSION_DIR/candidates.jsonl" --slurpfile decisions "$SESSION_DIR/decisions.jsonl" \
-    '{schema:1,result:$result,reason:$reason,version:$version,commit:$commit,kernel:$kernel,iperf_version:$iperf_version,
+    '{schema:2,result:$result,reason:$reason,version:$version,commit:$commit,script_sha256:$script_hash,kernel:$kernel,iperf_version:$iperf_version,
       target:$target,direction:$direction,interface:$iface,started:$started,ended:$ended,
       selected:$selected,applied:(if $persisted then true elif $restored then false else null end),persisted:$persisted,
       restore_attempted:($persisted|not),restore_verified:$restored,reboot_verified:false,
-      proxy_experience:(if $probe=="" then "not_verified" else "measured_on_probe_host" end),
+      proxy_experience:(if ([$measurements[]|select(.status=="ok" and .proxy.status=="ok")]|length)>0 then "measured_on_probe_host" else "not_verified" end),
+      proxy_probe:{configured:($probe!=""),valid_measurements:([$measurements[]|select(.status=="ok" and .proxy.status=="ok")]|length),
+        failed_measurements:([$measurements[]|select(.proxy.status=="failed")]|length)},
       proxy_service:$service,listener_refresh:(if $service=="" then "not_managed" else "explicit_service_restart" end),
       policy:($policy+{rate_ceiling_mbps:$rate,unlimited_rate:($rate==0),sample_mib:$sample_mib,
         measurement_mode:(if $rate==0 then "byte_bounded" else "timed" end),
         noise_rule:"paired_median_and_MAD_heuristic",statistical_significance_claimed:false,qdisc:"preserved"}),
       budget:{used_or_reserved_payload_bytes:$used,limit_bytes:$limit,wire_byte_hard_cap:false},
-      original:$original[0],requested:$request,final:$actual,acceptance:$stats,candidates:$candidates,decisions:$decisions,
+      original:$original[0],requested:$request,final:$actual,retests:$retests,acceptance:$acceptance,
+      acceptance_phase:{attempted:$acceptance_attempted,completed:$acceptance_completed,passed:$acceptance_passed},
+      candidates:$candidates,decisions:$decisions,
       measurements:$measurements,pairs:$pairs}' > "$tmp" || return 1
   mv "$tmp" "$SESSION_DIR/report.json"
 }
@@ -1427,9 +1502,9 @@ mystery_read_decimal(){
 }
 
 mystery_check_environment(){
-  local missing=0 command yn
+  local missing=0 command
   green "TCP 迷之调参环境检查"
-  for command in sysctl gawk modprobe cp mkdir cat; do
+  for command in sysctl gawk mkdir cat; do
     if has "$command"; then
       green "[已安装] $command"
     else
@@ -1438,11 +1513,8 @@ mystery_check_environment(){
     fi
   done
   if [ "$missing" -eq 1 ]; then
-    read -rp "必要依赖缺失，是否尝试安装基础依赖？[y/N]: " yn
-    [[ "$yn" =~ ^[Yy]$ ]] && install_base
-    for command in sysctl gawk modprobe cp mkdir cat; do
-      has "$command" || return 1
-    done
+    red '预览所需依赖缺失，请自行安装后重试；预览不安装组件或加载模块。'
+    return 1
   fi
   printf '当前可用拥塞控制算法: %s\n' "$(sysctl_value net.ipv4.tcp_available_congestion_control)"
   printf '当前默认 qdisc: %s\n' "$(sysctl_value net.core.default_qdisc)"
@@ -1463,8 +1535,8 @@ mystery_choose_transport(){
       2) MYSTERY_CC="cubic" ;;
       *) red "请选择 1 或 2。"; continue ;;
     esac
-    [[ " $available " == *" $MYSTERY_CC "* ]] && break
-    red "当前内核未报告 $MYSTERY_CC 可用，不能应用该配置。"
+    [[ " $available " == *" $MYSTERY_CC "* ]] || yellow "当前内核未报告 $MYSTERY_CC 可用，仅按公式生成预览。"
+    break
   done
   echo
   echo "选择队列算法（原默认值为 cake）："
@@ -1481,14 +1553,7 @@ mystery_choose_transport(){
       *) red "请选择 1、2 或 3。" ;;
     esac
   done
-  if [ "$MYSTERY_QDISC" != "fq" ]; then
-    if has modprobe; then
-      modprobe "sch_$MYSTERY_QDISC" >/dev/null 2>&1 ||
-        yellow "无法预加载 sch_$MYSTERY_QDISC；配置应用时将由当前内核最终验证。"
-    else
-      yellow "$MYSTERY_QDISC 需要当前内核支持；未检测到 modprobe，配置应用时将最终验证。"
-    fi
-  fi
+  yellow '队列选择仅用于公式预览，不加载模块或改动实际队列。'
 }
 
 mystery_generate_tcp_config(){
@@ -1790,14 +1855,7 @@ mystery_save_baseline_once(){
 }
 
 mystery_apply_candidate(){
-  cp "$MYSTERY_CANDIDATE" "$MYSTERY_CONF" || return 1
-  if sysctl -p "$MYSTERY_CONF"; then
-    green "迷之调参 TCP 配置已应用并持久化到 $MYSTERY_CONF"
-    return 0
-  fi
-  red "配置未能完整应用，正在尝试恢复迷之调参应用前基线。"
-  sysctl -p "$MYSTERY_BASELINE" >/dev/null 2>&1 || red "自动恢复失败，请手动检查 $MYSTERY_BASELINE。"
-  rm -f "$MYSTERY_CONF"
+  red '旧版公式配置仅供预览，应用和持久化已禁用；请使用自动调优流程。'
   return 1
 }
 
@@ -1841,7 +1899,7 @@ mystery_tune_flow(){
   clear_screen
   green "TCP 迷之调参"
   echo "依据原算法公式生成完整 sysctl 配置。"
-  yellow "注意：完整复现会写入 kernel、vm、ARP、路由与转发相关策略；应用前请检查预览。"
+  yellow "旧版公式仅生成预览，不能应用或持久化；其中包含未经本链路验证的系统策略。"
   echo
   mystery_choose_algorithm
   require_root || { pause; return; }
@@ -1915,20 +1973,11 @@ mystery_tune_flow(){
     cat "$MYSTERY_CANDIDATE"
   } >> "$MYSTERY_LOG"
   echo
-  green "当前内核待应用配置预览"
+  green "当前内核可识别的公式配置预览（不会应用）"
   cat "$MYSTERY_CANDIDATE"
   echo
-  yellow "该预览为原算法完整配置，会影响内核/内存/ARP/转发等系统策略；如应用失败，将自动尝试恢复应用前基线。"
-  read -rp "确认应用以上配置并持久化？[y/N]: " yn
-  [[ "$yn" =~ ^[Yy]$ ]] || { mystery_log "result=previewed-not-applied"; yellow "未应用配置；本次计算记录已写入 $MYSTERY_LOG。"; pause; return; }
-  if mystery_save_baseline_once && mystery_apply_candidate; then
-    mystery_log "result=applied persisted=$MYSTERY_CONF"
-    green "本次运行日志已写入 $MYSTERY_LOG"
-    yellow "公式生成配置尚未证明是本链路最优值；建议随后使用 iperf3 验证吞吐、重传和抖动。"
-  else
-    mystery_log "result=apply-failed"
-    red "迷之调参配置应用失败；检查日志 $MYSTERY_LOG。"
-  fi
+  mystery_log "result=previewed-not-applied"
+  yellow "仅保存公式预览和日志到 $STATE_DIR；未经测量验收，不提供应用入口。"
   pause
 }
 
@@ -1938,7 +1987,7 @@ mystery_tune_menu(){
     clear_screen
     green "调试区 - TCP 迷之调参"
     echo "--------------------------------"
-    echo "1. 开始一次迷之调参配置生成 / 应用"
+    echo "1. 生成旧版公式配置预览（禁止应用）"
     echo "2. 查看最近一次迷之调参运行日志"
     echo "0. 返回主菜单"
     echo
@@ -2011,12 +2060,20 @@ _proxy_probe_impl() (
   # May run on the actual client through a --probe-command SSH wrapper.
   # curl has bounded duration and response sizes; failures remain failures.
   set -uo pipefail
-  local tmp bulk_pid bulk_rc=0 rc http bytes elapsed sample i sample_bytes=0
+  local tmp bulk_pid bulk_rc=0 rc http bytes elapsed sample i sample_bytes=0 curl_banner
+  # Older curl cannot stop an unknown-length/chunked response at --max-filesize.
+  curl_banner="$(curl --disable --version 2>/dev/null)" || curl_banner=""
+  if ! [[ "$curl_banner" =~ ^curl[[:space:]]+([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})([[:space:]+-]|$) ]] ||
+    ! ((10#${BASH_REMATCH[1]} > 8 || (10#${BASH_REMATCH[1]} == 8 && 10#${BASH_REMATCH[2]} >= 4))); then
+    printf 'proxy probe requires curl >= 8.4.0 for bounded response bodies; upgrade curl on the probe host.\n' >&2
+    exit 1
+  fi
   tmp="$(mktemp -d)" || exit 1
   trap '[ -z "${bulk_pid:-}" ] || kill "$bulk_pid" 2>/dev/null || true; rm -f "$tmp/bulk" "$tmp/samples"; rmdir "$tmp"' EXIT
   local max_bytes="${PROXY_MAX_BYTES:-33554432}" small_max="${PROXY_SMALL_MAX_BYTES:-65536}"
   local duration="${PROXY_DURATION:-10}" count="${PROXY_REQUESTS:-20}"
-  local common=(--silent --show-error --socks5-hostname "${PROXY_HOST}:${PROXY_PORT:-1080}" --connect-timeout 5 --max-time "$duration" --output /dev/null)
+  # Ignore curlrc and NO_PROXY so the declared SOCKS path is actually measured.
+  local common=(--disable --silent --show-error --socks5-hostname "${PROXY_HOST}:${PROXY_PORT:-1080}" --noproxy "" --connect-timeout 5 --max-time "$duration" --output /dev/null)
   curl "${common[@]}" --range "0-$((max_bytes-1))" --max-filesize "$max_bytes" \
     --write-out '%{http_code} %{size_download} %{time_total}\n' "$PROXY_TEST_URL" > "$tmp/bulk" &
   bulk_pid=$!
@@ -2030,6 +2087,9 @@ _proxy_probe_impl() (
     read -r http bytes elapsed <<< "$sample"
     [[ "${bytes:-}" =~ ^[0-9]+$ ]] || bytes=0
     sample_bytes=$((sample_bytes+bytes))
+    # A request which finishes after the bulk ended is not a loaded sample.
+    # Its received bytes still belong to this measurement's traffic ledger.
+    kill -0 "$bulk_pid" 2>/dev/null || break
     jq -cn --argjson rc "$rc" --arg http "${http:-000}" --argjson elapsed "${elapsed:-0}" \
       '{ok:($rc==0 and ($http=="200" or $http=="206")),ms:($elapsed*1000)}' >> "$tmp/samples" || exit 1
   done
@@ -2117,7 +2177,7 @@ _auto_main(){
   local current_cc available_cc
   _validate_auto_options || { RUN_REASON=invalid_options; return 1; }
   require_root || { RUN_REASON=root_required; return 1; }
-  for cmd in sysctl awk iperf3 tc ip jq timeout flock cmp mktemp; do
+  for cmd in sysctl awk iperf3 tc ip jq timeout flock cmp mktemp sha256sum; do
     has "$cmd" || { red "缺少命令: $cmd"; RUN_REASON=missing_dependency; return 1; }
   done
   if [ -n "${PROXY_HOST:-}" ]; then has curl || { RUN_REASON=curl_required; return 1; }; fi
@@ -2229,18 +2289,23 @@ _auto_main(){
       "${CAND_CC[$i]}" "${CAND_QDISC[$i]}" "${CAND_WMEM[$i]}" "${CAND_RMEM[$i]}" "$AT_RETEST_ROUNDS" || rc=$?
     [ "$rc" -ne 2 ] || { RUN_REASON=baseline_restore_failed; return 1; }
     printf '%s\n' "$RETEST_STATS" > "$SESSION_DIR/retest-$i.json"
+    RETEST_RESULTS="$(jq -c --arg candidate "$MEASURE_CANDIDATE" --argjson complete "$([ "$rc" -eq 0 ] && echo true || echo false)" \
+      --argjson stats "$RETEST_STATS" '.+[{candidate:$candidate,completed:$complete,statistics:$stats}]' <<< "$RETEST_RESULTS")" || return 1
     if [ "$rc" -eq 0 ] && is_reliable_improvement; then winner="$i"; break; fi
     session_log "retest_rejected=$MEASURE_CANDIDATE reason=${MEASURE_REASON:-$IMPROVEMENT_REASON}"
   done
   [ "$winner" -ge 0 ] || { RUN_RESULT=no_change; RUN_REASON="${MEASURE_REASON:-insufficient_or_noisy_improvement}"; return 2; }
   # Fresh holdout data. A failed holdout is terminal: do not keep trying winners.
-  RETEST_STAGE=acceptance; MEASURE_REASON=""; rc=0
+  RETEST_STAGE=acceptance; MEASURE_REASON=""; rc=0; ACCEPTANCE_ATTEMPTED=true
   interleaved_retest "$AT_TARGET" "$AT_DIRECTION" "$AT_DURATION" \
     "${CAND_CC[$winner]}" "${CAND_QDISC[$winner]}" "${CAND_WMEM[$winner]}" "${CAND_RMEM[$winner]}" "$AT_ACCEPT_ROUNDS" || rc=$?
+  ACCEPTANCE_STATS="$RETEST_STATS"
+  [ "$rc" -ne 0 ] || ACCEPTANCE_COMPLETED=true
   [ "$rc" -ne 2 ] || { RUN_REASON=baseline_restore_failed; return 1; }
   if [ "$rc" -ne 0 ] || ! is_reliable_improvement; then
     RUN_RESULT=no_change; RUN_REASON="acceptance_${MEASURE_REASON:-$IMPROVEMENT_REASON}"; return 2
   fi
+  ACCEPTANCE_PASSED=true
   WINNER_CONFIG="$(jq -cn --arg cc "${CAND_CC[$winner]}" --arg q "${CAND_QDISC[$winner]}" \
     --arg w "${CAND_WMEM[$winner]}" --arg r "${CAND_RMEM[$winner]}" '{cc:$cc,qdisc:$q,wmem_max:$w,rmem_max:$r}')"
   RUN_SELECTED=true
@@ -2267,7 +2332,11 @@ _at_cleanup(){
       RUN_RESULT=failed; RUN_REASON=report_failed; rc=1
       if [ "$RUN_COMMITTED" -eq 1 ]; then
         RUN_COMMITTED=0
-        _restore_orig_persistent && session_restore_runtime && RUN_RESTORE_VERIFIED=true || restored=1
+        # A disk failure must not prevent restoring the still-writable runtime.
+        _restore_orig_persistent || restored=1
+        session_restore_runtime || restored=1
+        if [ "$restored" -eq 0 ]; then RUN_RESTORE_VERIFIED=true
+        else RUN_RESTORE_VERIFIED=false; fi
       fi
       _write_report || red '无法保存报告，请检查磁盘和会话目录。'
     fi
@@ -2275,8 +2344,10 @@ _at_cleanup(){
       RUN_RESULT=failed; RUN_REASON=completion_marker_failed; rc=1
       if [ "$RUN_COMMITTED" -eq 1 ]; then
         RUN_COMMITTED=0
-        if _restore_orig_persistent && session_restore_runtime; then RUN_RESTORE_VERIFIED=true
-        else RUN_RESTORE_VERIFIED=false; restored=1; fi
+        _restore_orig_persistent || restored=1
+        session_restore_runtime || restored=1
+        if [ "$restored" -eq 0 ]; then RUN_RESTORE_VERIFIED=true
+        else RUN_RESTORE_VERIFIED=false; fi
       fi
       _write_report || red '无法更新失败报告；会话未标记完成，请检查恢复状态。'
     fi
@@ -2297,7 +2368,8 @@ auto_tune_flow() (
   BUDGET_USED_BYTES=0; BUDGET_LIMIT_BYTES=0; MEASURE_SEQ=0
   RUN_RESULT=failed; RUN_REASON=not_started; RUN_SELECTED=false; RUN_COMMITTED=0
   RUN_RESTORE_VERIFIED=false; RUN_PERSIST_TOUCHED=0; RUN_START="$(date +%s)"
-  RETEST_STATS='{}'; WINNER_CONFIG=null
+  RETEST_STATS='{}'; RETEST_RESULTS='[]'; ACCEPTANCE_STATS=null
+  ACCEPTANCE_ATTEMPTED=false; ACCEPTANCE_COMPLETED=false; ACCEPTANCE_PASSED=false; WINNER_CONFIG=null
   trap '_at_cleanup "$?"' EXIT
   trap 'RUN_RESULT=failed; RUN_REASON=interrupted; exit 1' INT TERM
   if [ "$AT_AUTO" -ne 1 ]; then
@@ -2784,10 +2856,10 @@ menu(){
     green "[ 调试区 ]"
     echo "6. 本地/远程节点：自动调优（自动选参 + 持久化）"
     echo "7. SSH 多节点自动提交（暂时关闭，改用单目标测试）"
-    echo "8. TCP 迷之调参（已废弃，仅保留供参考）"
+    echo "8. TCP 迷之调参（已废弃，仅生成预览）"
     echo
     green "[ 恢复 / 退出 ]"
-    echo "9. 仅恢复调优前基线配置"
+    echo "9. 恢复最近自动调优会话的原配置"
     echo "10. 一键卸载附加组件并恢复初始化状态"
     echo "0. 退出"
     echo

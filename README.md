@@ -1,6 +1,6 @@
 # tcptune
 
-面向代理 VPS 的保守 TCP 参数试验工具，v2.2。适用于实际使用 Linux TCP socket 的链路；VLESS 的名称本身不代表传输方式，用户态 QUIC 拥塞控制不属于本工具的调优范围。
+面向代理 VPS 的保守 TCP 参数试验工具，v2.3。适用于实际使用 Linux TCP socket 的链路；VLESS 的名称本身不代表传输方式，用户态 QUIC 拥塞控制不属于本工具的调优范围。
 
 在指定路径、速率、时间和流量预算内寻找**足够好的配置**。原配置始终参与对照，证据不足就 `no_change`，不宣称全局最优或保证提速。
 
@@ -12,11 +12,11 @@
 - 接收方向保留测量，但没有对端证据时跳过接收缓冲扩容，也不比较不能作用于远端发送者的本机 CC。`no_change` 是合理结果。
 - SSH 多节点自动提交暂时关闭，避免旧分支绕过统一验收。可以分别指定不同目标运行单节点流程。
 
-原有环境检查、状态、内核安装等菜单仍保留；自动调优流程不安装内核。废弃的“迷之调参”不进入自动流程。
+原有环境检查、状态、内核安装等菜单仍保留；自动调优流程不安装内核。废弃的“迷之调参”只生成公式预览，应用和持久化入口已禁用。
 
 ## 运行
 
-Linux 上需要 Bash 4.3+、jq 1.6+、iperf3、iproute2、procps、GNU coreutils 和 util-linux。SOCKS5 探针还需要 curl；本地桥接/HTTP 测试端需要 Python 3。自动调优和恢复需要 root。
+Linux 上需要 Bash 4.3+、jq 1.6+、iperf3、iproute2、procps、GNU coreutils 和 util-linux。内置 SOCKS5/客户端探针还需要 **curl 8.4.0+**，以便对未知 Content-Length 的响应也能在下载途中执行 `--max-filesize` 上限；仅运行 iperf 不要求此 curl 版本。外部 `--probe-command` 自行保证流量边界。本地桥接/HTTP 测试端需要 Python 3。自动调优和恢复需要 root。
 
 ```bash
 sudo apt-get update
@@ -35,6 +35,8 @@ sudo bash tcptune.sh --auto-tune --target PEER_IP \
 ```
 
 `--direction download` 是兼容名称，明确表示 **VPS 发送到测试节点**；`upload` 表示节点发送到 VPS（iperf3 `-R`）。A→B 测试不能单独证明国内客户端→A 的体验。
+
+正在承载业务的 VPS 首轮保留 `--no-persist`，不要添加 `--proxy-service`。临时改变系统默认 CC/缓冲仍可能影响新连接，并占用带宽；已有代理监听 socket 未重建时，iperf 结果也不能证明代理连接实际采用了同一 CC。
 
 没有指定 `--auto-tune` 时进入菜单。参数顺序无关，缺失值、未知参数和非法阈值快速失败。循环地址仅允许临时测试。
 
@@ -113,6 +115,8 @@ sudo bash tcptune.sh --auto-tune --target PEER_IP --no-persist \
 
 可用内置 SOCKS5 探针，或 `--probe-command /absolute/path/to/executable` 接入实际客户端。每次 iperf 测量期间执行探针，同时大文件传输与小请求，并取得至少十个有负载的小请求样本。传输过快、样本不足时失败，增大受控文件/允许传输量后重新运行，不能将空数据当成功。
 
+发行版仓库提供的 curl 可能低于 8.4.0；先用 `curl --version` 核对，旧版探针会在发起流量前拒绝。安装基础依赖并不保证仓库中的 curl 满足此要求。只有在大传输仍活跃时完整结束的小请求才计作有负载样本；晚到响应的字节仍计入预算。
+
 ```bash
 sudo env PROXY_HOST=127.0.0.1 PROXY_PORT=1080 \
   PROXY_TEST_URL=http://ORIGIN_IP:8080/bulk \
@@ -160,7 +164,7 @@ export PROXY_HOST=127.0.0.1 PROXY_PORT=1080
 export PROXY_TEST_URL=http://B_IP:8080/bulk
 export PROXY_SMALL_URL=http://B_IP:8080/small
 export PROXY_MAX_BYTES=268435456 PROXY_REQUESTS=20 PROXY_DURATION=10
-python3 tools/probe_bridge.py --token-file probe.token --port 19090 --timeout 15
+python3 tools/probe_bridge.py --token-file probe.token --port 19090 --timeout 14
 
 # 客户端终端 2；使用已配置的 SSH 别名/密钥。
 scp probe.token vps-a:/root/tcptune/probe.token
@@ -185,10 +189,12 @@ chmod 700 client-hook.sh
 sudo env PROXY_MAX_BYTES=268435456 PROXY_REQUESTS=20 \
   bash tcptune.sh --auto-tune --target B_IP --no-persist \
   --probe-command /root/tcptune/client-hook.sh \
-  --proxy-service xray.service --duration 10 --budget-gib 32
+  --duration 10 --budget-gib 32
 ```
 
 代理路径必须实际经过 A；桥接脚本本身不创建代理或修改路由。先确认客户端探针能独立返回有效数据，再开始调优。桥接默认仅监听回环地址、校验 token，只能执行预配置探针，不能通过 HTTP 提交任意命令。
+
+以上示例保留现有代理服务。若明确允许中断连接并重建监听 socket，再额外指定 `--proxy-service 实际服务名`。修改测量时长时，同时调整客户端 `PROXY_DURATION`、桥接 `--timeout` 和回调 curl 的 `--max-time`；桥接超时应早于回调截止时间，自动测量的外层截止时间为 `--duration + 5` 秒。桥接超时或正常关闭时会终止并回收当前探针进程树，包括 Bash 启动的 curl；HTTP 调用方断开不会立即取消探针，仍受该超时约束。
 
 第一轮验证应用、报告与恢复；第二轮按带宽预算运行完整 A/B 与代理验收；最后在另一时段复核，才测试持久化。
 
@@ -199,17 +205,23 @@ sudo env PROXY_MAX_BYTES=268435456 PROXY_REQUESTS=20 \
 - 原始 sysctl、qdisc JSON、原配置及独立 `restore.sh`；
 - 每次原始 iperf JSON/stderr、可用的 socket 诊断和探针输出；
 - 参数计划、逐轮数据、配对结果、策略阈值和拒绝原因；
-- `report.json`：版本/commit、方向、原始/请求/最终配置、预算、选择/应用/恢复状态。CPU jiffies 和内存数据是诊断快照，未伪装成应用进程占用百分比。
+- `report.json`（schema 2）：版本/commit、脚本 SHA256、方向、原始/请求/最终配置、预算、选择/应用/恢复状态。`retests` 保存复测，`acceptance_phase` 分别标明独立验收是否进入、完成、通过；未进入验收时 `acceptance=null`。`proxy_probe` 记录配置情况及有效/失败测量数。CPU jiffies 和内存数据是诊断快照，未伪装成应用进程占用百分比。
 
 `flock` 保持整个会话和守护恢复的互斥；watchdog 检查父进程消失及截止时间。正常退出/中断通过统一清理路径恢复。独立恢复脚本冻结恢复代码，不依赖以后修改的 tcptune.sh。
+
+升级不会重写已有会话的冻结 `restore.sh`；新增恢复保护适用于新创建的会话。
 
 ```bash
 sudo bash /var/lib/tcptune/sessions/latest/restore.sh
 ```
 
+菜单 9 调用最近自动会话的同一份恢复脚本，遵守互斥锁和旧会话保护。菜单 10 在同一把锁下先恢复最近完整会话，再清理旧版配置和附加组件；存在未确认恢复的会话时停止清理，先使用它的 `restore.sh` 修复。清理保留自动会话目录作为恢复证据。
+
 持久化只更新本轮选中的 CC/缓冲项，保留原文件其他条目和注释，临时文件原子替换并逐项验证。不执行全局 `sysctl --system`，避免载入与测量无关的配置。恢复先恢复原配置文件，再还原实际运行值，不全局重载。
 
 `reboot_verified=false` 表示没有验证重启：其他 sysctl 文件、服务配置和应用的 socket 设置仍可能影响重启后的有效状态。旧会话不能覆盖更新的会话；恢复失败时检查报告和会话目录后先处理恢复，再开始新调优。
+
+`restore_verified=true` 只确认本轮保存的默认 sysctl、配置文件和 qdisc 已核对恢复。实验期间创建的业务 socket 仍可能保留当时的 CC，直到自然关闭；恢复系统默认值不能改回这些既有 socket。禁止重启代理服务的测试必须保留这一限制，不能宣称对所有业务连接完全无影响。
 
 ## 测试与验证边界
 
@@ -219,16 +231,23 @@ bash tests/regression.sh
 bash tests/measurement.sh
 bash tests/integration.sh
 bash tests/linux-process.sh
+bash tests/usability.sh
+bash tests/reporting.sh
+bash tests/proxy.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 
 # 负对照应返回非零，并显示 FAIL=1。
 TCPTUNE_TEST_NEGATIVE_CONTROL=1 bash tests/regression.sh
 ```
 
-Bash 回归/流程测试均使用 fake sysctl/tc/iperf，不修改宿主参数、不访问公网；Linux 进程测试用真实 flock、真实进程和 SIGKILL 验证 watchdog，仍只写假内核状态。缺少 flock 的 Windows 明确 SKIP。Python 测试仅使用本机回环 HTTP。
+Bash 回归/流程/菜单测试均使用 fake sysctl/tc/iperf，不修改宿主参数、不访问公网；Linux 进程测试用真实 flock、真实进程和 SIGKILL 验证 watchdog，仍只写假内核状态。缺少 flock 的 Windows 明确 SKIP。Python 测试使用本机回环 HTTP，并验证真实探针子进程的超时清理。
 
 测试断言在子进程内计数并回传父进程，任意断言失败或场景异常会使整套测试非零退出。覆盖配对噪声、吞吐/延迟分支、独立验收、应用/读回/保存/报告失败、中断与独立恢复等。
 
 这些测试不证明公网收益、真实内核写入或运营商计费流量控制。需要真实 Linux VPS 和客户端验证；最终阈值与候选范围依实测收敛。
+
+`tests/` 内的性能数值是合成用例，用于检验拒绝/验收逻辑。判断实测效果应核对会话目录中的原始 iperf/probe 输出、`script_sha256`、方向、速率和时长；仅看到 `selected=true` 或部分复测改善不足以证明完成独立验收。没有真实客户端探针时，`proxy_experience=not_verified`，不能据此宣称国内 VLESS 体验改善。
+
+[2026-10-16 VPS 验证记录](docs/validation/2026-10-16/README.md) 提供两条公网路径的实际结果、逐轮数据及验证边界。路径效果不同，不能将某条线路的改善推广到所有线路。
 
 参考：[Linux TCP sysctl 文档](https://docs.kernel.org/networking/ip-sysctl.html)、[iperf3 官方说明](https://software.es.net/iperf/invoking.html)。

@@ -199,7 +199,7 @@ multiple_candidates(){
 noisy(){
   setup_mock; MOCK_SCENARIO=noisy; run_mock_auto
   assert_eq 'stable paired gain below measured noise stays unchanged' 2 "$AUTO_RC"
-  assert_json 'noise raises the acceptance threshold' "$REPORT" '.acceptance.tp_threshold>5'
+  assert_json 'noise raises the retest threshold before holdout' "$REPORT" '.retests[0].statistics.tp_threshold>5 and .acceptance==null'
 }
 
 interrupted(){
@@ -216,6 +216,22 @@ report_failure(){
   assert_eq 'report write failure rejects commit' 1 "$AUTO_RC"
   assert_eq 'report write failure restores runtime' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
   assert_ok 'report write failure restores persistent config' cmp -s "$CONF" "$CASE_TMP/original.conf"
+}
+
+report_and_persistent_restore_failure(){
+  setup_mock
+  eval "$(declare -f _write_report | sed '1s/_write_report/_write_report_real/')"
+  _write_report(){
+    [ "$RUN_COMMITTED" -ne 1 ] || return 1
+    _write_report_real
+  }
+  _restore_orig_persistent(){ return 1; }
+  run_mock_auto
+  assert_eq 'report and persistent restore failures reject commit' 1 "$AUTO_RC"
+  assert_eq 'runtime rollback still runs after persistent restore fails' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  assert_json 'report retains unverified persistent restoration' "$REPORT" '.result=="failed" and .reason=="report_failed" and (.persisted|not) and (.restore_verified|not)'
+  assert_bad 'incomplete rollback does not mark session complete' test -f "$(dirname "$REPORT")/complete"
+  assert_ok 'unrestored persistent candidate is visible for recovery' grep -q 'net.ipv4.tcp_congestion_control = bbr' "$CONF"
 }
 
 proxy_service(){
@@ -267,6 +283,20 @@ completion_failure(){
   assert_ok 'completion failure restores old config' cmp -s "$CONF" "$CASE_TMP/original.conf"
 }
 
+completion_and_persistent_restore_failure(){
+  setup_mock
+  touch(){
+    case "$1" in */complete) return 1 ;; *) command touch "$@" ;; esac
+  }
+  _restore_orig_persistent(){ return 1; }
+  run_mock_auto
+  assert_eq 'completion and persistent restore failures reject commit' 1 "$AUTO_RC"
+  assert_eq 'completion rollback still restores runtime after disk failure' cubic "$(sysctl_value net.ipv4.tcp_congestion_control)"
+  assert_json 'completion failure reports incomplete restoration' "$REPORT" '.result=="failed" and .reason=="completion_marker_failed" and (.persisted|not) and (.restore_verified|not)'
+  assert_bad 'failed completion remains incomplete' test -f "$(dirname "$REPORT")/complete"
+  assert_ok 'persistent recovery remains necessary' grep -q 'net.ipv4.tcp_congestion_control = bbr' "$CONF"
+}
+
 run_case committed committed
 run_case no-persist temporary
 run_case negligible-gain unchanged
@@ -292,9 +322,11 @@ run_case multiple-candidates multiple_candidates
 run_case noisy-pairs noisy
 run_case signal-rollback interrupted
 run_case report-failure report_failure
+run_case report-and-persistent-restore-failure report_and_persistent_restore_failure
 run_case proxy-service-refresh proxy_service
 run_case proxy-service-failure proxy_service_failure
 run_case completion-marker-failure completion_failure
+run_case completion-and-persistent-restore-failure completion_and_persistent_restore_failure
 run_case unlimited-temporary uncapped_temporary
 run_case candidate-plan-failure candidate_plan_failure
 finish_suite

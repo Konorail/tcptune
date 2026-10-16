@@ -89,6 +89,58 @@ timed_measurement(){
   assert_eq 'timed mode also charges actual sender bytes' 4194304 "$BUDGET_USED_BYTES"
 }
 
+invalid_iperf_json(){
+  prepare_measurement
+  cp "$CASE_TMP/input.json" "$CASE_TMP/valid.json"
+  local fixture
+  for fixture in empty whitespace object array multiple; do
+    case "$fixture" in
+      empty) : > "$CASE_TMP/input.json" ;;
+      whitespace) printf ' \n\t\n' > "$CASE_TMP/input.json" ;;
+      object) printf '{}\n' > "$CASE_TMP/input.json" ;;
+      array) printf '[]\n' > "$CASE_TMP/input.json" ;;
+      multiple) cat "$CASE_TMP/valid.json" "$CASE_TMP/valid.json" > "$CASE_TMP/input.json" ;;
+    esac
+    BUDGET_USED_BYTES=0
+    assert_bad "$fixture iperf output fails closed" run_iperf3_json 192.0.2.1 download 2 1
+    assert_eq "$fixture iperf output has an explicit reason" iperf_measurement_failed "$MEASURE_REASON"
+    assert_eq "$fixture iperf output retains its reservation" 4325376 "$BUDGET_USED_BYTES"
+  done
+  assert_eq 'every rejected iperf result remains in evidence' 5 "$(wc -l < "$SESSION_DIR/measurements.jsonl" | tr -d ' ')"
+  assert_json 'invalid iperf evidence never claims usable metrics' "$SESSION_DIR/measurements.jsonl" \
+    '.status=="failed" and .reason=="iperf_measurement_failed" and .metrics=={}'
+}
+
+invalid_probe_json(){
+  prepare_measurement
+  BUDGET_LIMIT_BYTES=100000000
+  AT_PROBE_COMMAND="$CASE_TMP/probe.sh"
+  printf '#!/usr/bin/env bash\ncat %q\n' "$CASE_TMP/probe-input.json" > "$AT_PROBE_COMMAND"
+  chmod +x "$AT_PROBE_COMMAND"
+  printf '%s\n' '{"status":"ok","requests":20,"errors":0,"p50_ms":10,"p95_ms":20,"download_mbps":10,"bytes":1000}' > "$CASE_TMP/probe-valid.json"
+  local fixture
+  for fixture in empty whitespace object array multiple; do
+    case "$fixture" in
+      empty) : > "$CASE_TMP/probe-input.json" ;;
+      whitespace) printf ' \n\t\n' > "$CASE_TMP/probe-input.json" ;;
+      object) printf '{}\n' > "$CASE_TMP/probe-input.json" ;;
+      array) printf '[]\n' > "$CASE_TMP/probe-input.json" ;;
+      multiple) cat "$CASE_TMP/probe-valid.json" "$CASE_TMP/probe-valid.json" > "$CASE_TMP/probe-input.json" ;;
+    esac
+    BUDGET_USED_BYTES=0
+    assert_bad "$fixture probe output fails closed" run_iperf3_json 192.0.2.1 download 2 1
+    assert_eq "$fixture probe output has an explicit reason" proxy_measurement_failed "$MEASURE_REASON"
+    assert_eq "$fixture probe output retains its reservation" 39059456 "$BUDGET_USED_BYTES"
+  done
+  assert_eq 'every rejected probe result remains in evidence' 5 "$(wc -l < "$SESSION_DIR/measurements.jsonl" | tr -d ' ')"
+  assert_json 'invalid probe evidence never claims a successful probe' "$SESSION_DIR/measurements.jsonl" \
+    '.status=="failed" and .reason=="proxy_measurement_failed" and .proxy.status=="failed"'
+  cp "$CASE_TMP/probe-valid.json" "$CASE_TMP/probe-input.json"
+  BUDGET_USED_BYTES=0
+  assert_ok 'one valid probe object still succeeds' run_iperf3_json 192.0.2.1 download 2 1
+  assert_eq 'valid probe charges its actual bytes' 4195304 "$BUDGET_USED_BYTES"
+}
+
 run_case byte-quota-and-direction byte_quota
 run_case byte-budget-preflight quota_preflight
 run_case short-sample short_sample
@@ -96,4 +148,6 @@ run_case quota-overrun quota_overrun
 run_case failed-measurement failed_measurement
 run_case measurement-timeout deadline
 run_case timed-compatibility timed_measurement
+run_case invalid-iperf-json invalid_iperf_json
+run_case invalid-probe-json invalid_probe_json
 finish_suite
